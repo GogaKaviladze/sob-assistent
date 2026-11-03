@@ -1,0 +1,81 @@
+# Persönliche App-Launcher (lokale Pfade/Modellnamen, nicht teilen)
+AppStart.txt
+*.command
+!start.command
+
+
+# Private Dokumente (Briefe, interne Vorschläge, nicht Teil des Codes)
+private/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+/.venv
+venv/
+env/
+
+# Word/Office temporary lock files
+~$*.docx
+~$*.xlsx
+
+# Environment
+.env
+.env.local
+
+# Data (never commit client data)
+data/clients/
+data/exports/
+data/uploads/
+*.csv
+*.xlsx
+*.xls
+!data/samples/*.csv.example
+!templates/**/*.csv
+!synthetic_test_data/**
+
+# Generated reports (may contain personal data)
+output/
+
+# Lokale GGUF-Modelle (~4,9 GB, nie committen — ADR-2/ADR-8)
+models/
+/models
+
+# Lokale Dummy-/Testdaten (echte oder erfundene Klientendaten — nie committen)
+dummy/
+/dummy
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+~$*
+
+# Testing
+.pytest_cache/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Lokale Test-Skripte
+test-scripts/
+
+# Vault
+.code_vault

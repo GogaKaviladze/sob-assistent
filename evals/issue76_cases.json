@@ -1,0 +1,67 @@
+[
+  {
+    "id": "einzelne_beobachtung",
+    "title": "Eine einzelne Beobachtung begründet noch kein Ziel",
+    "entries": [],
+    "messages": [
+      "Herr Mustermann öffnete beim letzten Termin einen Brief selbst."
+    ],
+    "expected": {
+      "goal_state": "empty",
+      "last_reply_has_question": true,
+      "forbidden_phrases": ["regelmäßig", "Selbstvertrauen stärken"]
+    }
+  },
+  {
+    "id": "wunsch_ohne_zeitraum",
+    "title": "Ein Wunsch ohne Zeitraum bleibt klärungsbedürftig",
+    "entries": [],
+    "messages": [
+      "Herr Mustermann möchte Briefe künftig selbst öffnen. Der Zeitraum ist noch nicht vereinbart."
+    ],
+    "expected": {
+      "last_reply_has_question": true,
+      "forbidden_phrases": ["bis zum nächsten Termin", "wöchentlich"]
+    }
+  },
+  {
+    "id": "vollstaendiger_zielauftrag",
+    "title": "Ein vollständiger Zielauftrag kann als Vorschlag verarbeitet werden",
+    "entries": [],
+    "messages": [
+      "Bitte als Zielvorschlag formulieren: Herr Mustermann möchte bis zum 31.12.2026 bei drei von vier Terminen einen ausgewählten Brief selbst öffnen."
+    ],
+    "expected": {
+      "goal_state": "present",
+      "required_phrases": ["31.12.2026"],
+      "forbidden_phrases": ["Hans,"]
+    }
+  },
+  {
+    "id": "unsicherheit",
+    "title": "Eine Wissenslücke bleibt als Unsicherheit erhalten",
+    "entries": [],
+    "messages": [
+      "Das kann ich noch nicht beurteilen."
+    ],
+    "expected": {
+      "goal_state": "empty",
+      "uncertainty_contains": ["Das kann ich noch nicht beurteilen."],
+      "forbidden_phrases": ["regelmäßig", "zeigt sich stabil"]
+    }
+  },
+  {
+    "id": "korrektur",
+    "title": "Eine Korrektur ersetzt die vorherige Beobachtung",
+    "entries": [],
+    "messages": [
+      "Beim letzten Besuch öffnete Herr Mustermann den Brief selbst.",
+      "Korrektur: Beim letzten Besuch öffnete die Assistenz den Brief."
+    ],
+    "expected": {
+      "notes_contain": ["Assistenz den Brief"],
+      "notes_forbid": ["Herr Mustermann den Brief selbst"],
+      "forbidden_phrases": ["Hans,"]
+    }
+  }
+]

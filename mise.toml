@@ -1,0 +1,4 @@
+# Sprachversion pro Projekt (siehe mac-setup, Abschnitt 3).
+# `mise install` richtet exakt diese Python-Version ein, `cd` aktiviert sie.
+[tools]
+python = "3.12"

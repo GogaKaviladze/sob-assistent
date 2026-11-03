@@ -1,0 +1,617 @@
+"""FastAPI-Webanwendung für den interaktiven Reflexions-Chat (KISS, Separation of Concerns).
+
+Stellt Endpunkte für den CSV-Upload, interaktives Token-Streaming,
+Modellauswahl aus models/, Export des Chatverlaufs und Diagnose-Logging bereit.
+"""
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
+
+from sob_generator.docx_safety import UnsafeDocxError
+from .chatbot import ReflectionChatbot, ReflectionEngine, get_candidate_model_directories
+from .csv_loader import CsvData, parse_csv_content
+from .docx_exporter import (
+    DocxExportError,
+    EmptyExportError,
+    UnknownTemplateError,
+    UnmappedChatContentError,
+    export_chatbot_to_docx,
+)
+from .logger import get_recent_logs, log_csv_loaded, log_plan_loaded, logger
+from .plan_loader import (
+    IncompletePlanError,
+    PlanData,
+    extract_client_name_from_filename,
+    parse_plan_docx,
+)
+from .upload_limits import (
+    LimitUploadSizeMiddleware,
+    configure_spool_threshold,
+    get_max_upload_bytes,
+)
+
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+
+
+class ChatMessageRequest(BaseModel):
+    message: str
+
+
+class SelectModelRequest(BaseModel):
+    model_name: str
+
+
+class SetPlanRequest(BaseModel):
+    plan_text: str
+    filename: Optional[str] = None
+    title: Optional[str] = None
+
+
+DEFAULT_DOCX_PARSE_TIMEOUT = 10.0
+
+
+def get_docx_parse_timeout() -> float:
+    raw = os.getenv("SOB_DOCX_PARSE_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_DOCX_PARSE_TIMEOUT
+    try:
+        val = float(raw)
+        return val if val > 0 else DEFAULT_DOCX_PARSE_TIMEOUT
+    except ValueError:
+        return DEFAULT_DOCX_PARSE_TIMEOUT
+
+
+def create_app(
+    chatbot: Optional[ReflectionChatbot] = None,
+    max_upload_bytes: Optional[int] = None,
+) -> FastAPI:
+    """Application Factory für flexible Testbarkeit und Instanziierung."""
+    limit = max_upload_bytes if max_upload_bytes is not None else get_max_upload_bytes()
+    # Starlette Spool-Schwelle setzen (Garantie: keine Upload-Daten auf Festplatte)
+    configure_spool_threshold(limit)
+
+    app = FastAPI(
+        title="Fachdialog & Reflexion Chatbot",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.add_middleware(LimitUploadSizeMiddleware, max_bytes=limit)
+    bot = chatbot or ReflectionChatbot()
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> HTMLResponse:
+        """Liefert die interaktive Benutzeroberfläche aus."""
+        template_file = TEMPLATES_DIR / "index.html"
+        if not template_file.exists():
+            raise HTTPException(status_code=500, detail="UI-Template nicht gefunden.")
+        return HTMLResponse(content=template_file.read_text(encoding="utf-8"))
+
+    @app.post("/api/upload")
+    async def upload_csv(
+        file: UploadFile = File(...),
+        new_case: bool = Form(False),
+    ):
+        """Lädt eine CSV-Datei hoch, parst sie und übergibt sie dem Chatbot als Kontext."""
+        bot.check_ttl()
+        if not file.filename or not file.filename.lower().endswith(".csv"):
+            raise HTTPException(status_code=400, detail="Bitte eine gültige .csv-Datei hochladen.")
+
+        content_bytes = await file.read()
+        try:
+            content_text = content_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                content_text = content_bytes.decode("latin-1")
+            except Exception as exc:
+                logger.warning("Fehler beim Dekodieren der CSV-Datei: %s", type(exc).__name__)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"❌ Konnte Datei-Encoding nicht lesen ({type(exc).__name__}).",
+                ) from exc
+
+        detected_client = extract_client_name_from_filename(file.filename)
+        client_name = detected_client if detected_client else "Klient*in (anonymisiert)"
+
+        try:
+            parsed_csv = parse_csv_content(content_text, filename=file.filename, client_name=client_name)
+        except Exception as exc:
+            logger.warning("Fehler beim Parsen der CSV-Datei: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=400,
+                detail=f"❌ CSV-Datei konnte nicht verarbeitet werden ({type(exc).__name__}).",
+            ) from exc
+
+        # Wenn parsed_csv einen strukturiert erfassten Klientennamen ermittelt hat, bevorzugen
+        if parsed_csv.client_name and parsed_csv.client_name != "Klient*in (anonymisiert)":
+            client_name = parsed_csv.client_name
+
+        is_vivendi = bool(parsed_csv.entries) or ("vivendi" in file.filename.lower())
+        source = "Vivendi PD Verlaufsbericht" if is_vivendi else f"Verlaufsdokumentation ({file.filename})"
+
+        if not new_case:
+            # Konfliktprüfung für harten Fall-Reset (Issue #133):
+            # (a) Dateityp bereits geladen, (b) Chat-Verlauf existiert, (c) Klientenkonflikt
+            has_same_type = bot.has_csv
+            has_history = len(bot.messages) > 0
+            plan_client = getattr(bot.plan_data, "client_name", "") if bot.plan_data else ""
+            client_conflict = False
+            effective_csv_client = client_name if client_name != "Klient*in (anonymisiert)" else detected_client
+            if plan_client and effective_csv_client:
+                p_norm = plan_client.strip().lower()
+                d_norm = effective_csv_client.strip().lower()
+                generic = {"klient*in (anonymisiert)", "klient*in", "anonymisiert", "synthetischer klient", ""}
+                if p_norm not in generic and d_norm not in generic:
+                    if p_norm != d_norm and p_norm not in d_norm and d_norm not in p_norm:
+                        client_conflict = True
+
+            if has_same_type or has_history or client_conflict:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "needs_confirmation": True,
+                        "detail": "Neuer Fall? Alle Daten dieses Falls werden gelöscht.",
+                    },
+                )
+        else:
+            bot.hard_reset(reason="reset")
+
+        bot.set_csv(parsed_csv)
+        log_csv_loaded(total_rows=parsed_csv.entries_total, columns_count=len(parsed_csv.headers))
+
+        # Erste 3 Zeilen als Vorschau für die UI
+        preview_lines = parsed_csv.to_context_text(max_rows=3, update_counters=False)
+
+        return {
+            "success": True,
+            "filename": parsed_csv.filename,
+            "total_rows": parsed_csv.total_rows,
+            "entries_total": parsed_csv.entries_total,
+            "entries_in_context": parsed_csv.entries_in_context,
+            "oldest_included_date": parsed_csv.oldest_included_date,
+            "headers": parsed_csv.headers,
+            "preview": preview_lines,
+            "client_name": client_name,
+            "source": source,
+        }
+
+    @app.post("/api/upload-plan")
+    async def upload_plan(
+        file: UploadFile = File(...),
+        new_case: bool = Form(False),
+    ):
+        """Lädt einen Vorbericht / Gesamtplan (.docx, .txt oder .md) hoch, parst ihn und übergibt ihn dem Chatbot als Kontext."""
+        bot.check_ttl()
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Dateiname fehlt.")
+
+        lower_name = file.filename.lower()
+        if not (lower_name.endswith(".docx") or lower_name.endswith(".txt") or lower_name.endswith(".md")):
+            raise HTTPException(status_code=400, detail="Bitte eine gültige .docx-, .txt- oder .md-Datei hochladen.")
+
+        content_bytes = await file.read()
+
+        if lower_name.endswith(".docx"):
+            timeout = get_docx_parse_timeout()
+            try:
+                parsed_plan = await asyncio.wait_for(
+                    run_in_threadpool(parse_plan_docx, content_bytes, filename=file.filename),
+                    timeout=timeout,
+                )
+            except (UnsafeDocxError, asyncio.TimeoutError) as exc:
+                reason = "timeout" if isinstance(exc, asyncio.TimeoutError) else getattr(exc, "reason", "unsafe")
+                logger.warning("Upload-Plan abgelehnt: %s", reason)
+                raise HTTPException(
+                    status_code=400,
+                    detail="❌ Datei abgelehnt: ungültiges oder zu großes Word-Dokument",
+                ) from exc
+            except IncompletePlanError as exc:
+                logger.warning("Vorbericht unvollständig: %d von %d Bereichen erkannt", exc.found, exc.expected)
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"❌ Vorbericht unvollständig gelesen: {exc.found} von {exc.expected} Bereichen erkannt. Bitte Datei prüfen.",
+                ) from exc
+            except Exception as exc:
+                logger.warning("Fehler beim Parsen der Vorbericht-Datei: %s", type(exc).__name__)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"❌ Plan konnte nicht gelesen werden ({type(exc).__name__}).",
+                ) from exc
+
+            detected_plan_client = extract_client_name_from_filename(file.filename)
+            effective_plan_client = parsed_plan.client_name or detected_plan_client
+            csv_client = getattr(bot.csv_data, "client_name", "") if bot.csv_data else ""
+            client_conflict = False
+            if csv_client and effective_plan_client:
+                c_norm = csv_client.strip().lower()
+                p_norm = effective_plan_client.strip().lower()
+                generic = {"klient*in (anonymisiert)", "klient*in", "anonymisiert", "synthetischer klient", ""}
+                if c_norm not in generic and p_norm not in generic:
+                    if c_norm != p_norm and c_norm not in p_norm and p_norm not in c_norm:
+                        client_conflict = True
+
+            if not new_case:
+                has_same_type = bot.has_plan
+                has_history = len(bot.messages) > 0
+                if has_same_type or has_history or client_conflict:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "needs_confirmation": True,
+                            "detail": "Neuer Fall? Alle Daten dieses Falls werden gelöscht.",
+                        },
+                    )
+            else:
+                bot.hard_reset(reason="reset")
+
+            bot.set_plan(parsed_plan)
+            log_plan_loaded(goals_count=parsed_plan.goals_count)
+
+            return {
+                "success": True,
+                "has_plan": True,
+                "filename": parsed_plan.filename,
+                "goals_count": parsed_plan.goals_count,
+                "preview": parsed_plan.preview,
+                "client_name": parsed_plan.client_name,
+                "zeitraum_von": parsed_plan.zeitraum_von,
+                "zeitraum_bis": parsed_plan.zeitraum_bis,
+                "hidden_removed": getattr(parsed_plan, "hidden_removed", 0),
+            }
+        elif lower_name.endswith(".txt") or lower_name.endswith(".md"):
+            try:
+                content_text = content_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                try:
+                    content_text = content_bytes.decode("latin-1")
+                except Exception as exc:
+                    logger.warning("Fehler beim Dekodieren der Vorbericht-Datei: %s", type(exc).__name__)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"❌ Konnte Datei-Encoding nicht lesen ({type(exc).__name__}).",
+                    ) from exc
+
+            if not new_case:
+                has_same_type = bot.has_plan
+                has_history = len(bot.messages) > 0
+                if has_same_type or has_history:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "needs_confirmation": True,
+                            "detail": "Neuer Fall? Alle Daten dieses Falls werden gelöscht.",
+                        },
+                    )
+            else:
+                bot.hard_reset(reason="reset")
+
+            bot.set_plan_context(content_text, plan_info={"filename": file.filename})
+            return {
+                "success": True,
+                "has_plan": True,
+                "filename": file.filename,
+                "goals_count": 0,
+                "client_name": "",
+                "zeitraum_von": "",
+                "zeitraum_bis": "",
+                "preview": (bot.plan_context[:200] if bot.plan_context else ""),
+            }
+
+    @app.post("/api/chat-stream")
+    async def chat_stream(req: ChatMessageRequest):
+        """Streamt die Modellantwort Token für Token via Server-Sent Events (SSE)."""
+        bot.check_ttl()
+        if bot.provider is None:
+            reason = bot.model_error or "Modelldatei fehlt"
+            raise HTTPException(status_code=503, detail=f"❌ Kein Modell geladen: {reason}")
+
+        user_msg = req.message.strip()
+        if not user_msg:
+            raise HTTPException(status_code=400, detail="Nachricht darf nicht leer sein.")
+
+        def event_generator():
+            for item in bot.chat_stream(user_msg):
+                if isinstance(item, dict) and "error" in item:
+                    yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                    return
+                yield f"data: {json.dumps({'token': item}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True, 'model': bot.model_info}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/api/chat")
+    async def chat_message(req: ChatMessageRequest) -> Dict[str, Any]:
+        """Synchrone Variante für nicht-streamende Anfragen."""
+        bot.check_ttl()
+        if bot.provider is None:
+            reason = bot.model_error or "Modelldatei fehlt"
+            raise HTTPException(status_code=503, detail=f"❌ Kein Modell geladen: {reason}")
+
+        user_msg = req.message.strip()
+        if not user_msg:
+            raise HTTPException(status_code=400, detail="Nachricht darf nicht leer sein.")
+
+        reply = bot.chat(user_msg)
+        return {
+            "reply": reply,
+            "model": bot.model_info,
+            "history_length": len(bot.messages),
+            "history": bot.get_history(),
+        }
+
+    @app.get("/api/models")
+    async def get_models() -> Dict[str, Any]:
+        """Listet alle gefundenen .gguf Modelle auf und gibt die durchsuchten Pfade an."""
+        models = bot.get_available_models()
+        candidate_dirs = [str(d) for d in get_candidate_model_directories()]
+        return {
+            "models": models,
+            "active": bot.model_info,
+            "searched_directories": candidate_dirs,
+            "count": len(models),
+        }
+
+    @app.post("/api/select-model")
+    async def select_model(req: SelectModelRequest) -> Dict[str, Any]:
+        """Wechselt das aktive Modell auf ein anderes Modell aus models/."""
+        try:
+            new_info = bot.switch_model(req.model_name)
+            return {"success": True, "model": new_info}
+        except Exception as exc:
+            logger.warning("Fehler beim Modellwechsel: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=400,
+                detail=f"❌ Modellwechsel fehlgeschlagen ({type(exc).__name__}).",
+            ) from exc
+
+    @app.post("/api/plan")
+    async def set_plan(req: SetPlanRequest) -> Dict[str, Any]:
+        """Hinterlegt einen Vorbericht / Gesamtplan als Kontext für den Chatbot."""
+        if not req.plan_text.strip():
+            raise HTTPException(status_code=400, detail="Plan-Text darf nicht leer sein.")
+
+        info = {}
+        if req.filename:
+            info["filename"] = req.filename
+        if req.title:
+            info["title"] = req.title
+
+        bot.set_plan_context(req.plan_text, plan_info=info)
+        return {
+            "success": True,
+            "has_plan": True,
+            "plan_info": bot.plan_info,
+            "preview": bot.plan_context[:200] if bot.plan_context else "",
+        }
+
+    @app.post("/api/reset-plan")
+    async def reset_plan() -> Dict[str, bool]:
+        """Entfernt den hinterlegten Vorbericht / Gesamtplan."""
+        bot.clear_plan()
+        return {"success": True}
+
+    @app.get("/api/export")
+    async def export_chat() -> Dict[str, Any]:
+        """Liefert den vollständigen Chatverlauf strukturiert als Markdown."""
+        return {
+            "markdown": bot.export_markdown(),
+        }
+
+    @app.get("/api/export/docx")
+    async def export_chat_docx(template: str = ""):
+        """Generiert und liefert den ausgefüllten Word-Bericht (.docx) basierend auf der gewählten Vorlage."""
+        if not template:
+            raise HTTPException(
+                status_code=400,
+                detail="Bitte eine Vorlage angeben (?template=hamburg oder ?template=op-de-wisch).",
+            )
+        try:
+            result = export_chatbot_to_docx(bot, template_name=template)
+            docx_bytes, filename = result
+            warnings = getattr(result, "warnings", [])
+            manual_fields = getattr(result, "manual_fields", [])
+        except UnmappedChatContentError as exc:
+            # DSGVO-konform: Nur Zähler loggen, keine Personen- oder Inhaltsdaten
+            logger.warning(
+                "DOCX-Export abgelehnt: Chat-Inhalt konnte keinem Bereich zugeordnet werden (%d unzugeordnete Blöcke)",
+                len(getattr(exc, "unmapped_blocks", [])),
+            )
+            # Generisches Detail: keine Überschriften oder Dialogtexte zurückspiegeln
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "❌ Dialog-Inhalt konnte keinem Bereich zugeordnet werden "
+                    f"({len(getattr(exc, 'unmapped_blocks', []))} Abschnitt(e)). Bitte Bereichsüberschriften "
+                    "wie „1.2 Alltägliche Lebensführung“ verwenden. (Fehlercode: DOCX_UNMAPPED)"
+                ),
+            ) from None
+        except (UnknownTemplateError, EmptyExportError) as exc:
+            # Feste Texte aus docx_exporter (Vorlagenwahl / leere Sitzung), ohne Falldaten
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except DocxExportError as exc:
+            # DSGVO: nur Fehlerklasse loggen, nie den Exception-Text (kann Falldaten enthalten)
+            logger.error("DOCX-Export fehlgeschlagen (Fehlercode: DOCX_EXPORT_ERROR, %s)", type(exc).__name__)
+            raise HTTPException(
+                status_code=500, detail="❌ Export fehlgeschlagen (Fehlercode: DOCX_EXPORT_ERROR)"
+            ) from None
+        except Exception as exc:
+            logger.error("DOCX-Export unerwartet fehlgeschlagen (Fehlercode: DOCX_INTERNAL, %s)", type(exc).__name__)
+            raise HTTPException(
+                status_code=500, detail="❌ Export fehlgeschlagen (Fehlercode: DOCX_INTERNAL)"
+            ) from None
+
+        # DSGVO-konform: Keine personenbezogenen Dateinamen loggen
+        logger.info("DOCX-Export erfolgreich ausgeliefert (Größe: %d Bytes)", len(docx_bytes))
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(docx_bytes)),
+        }
+        expose_headers = ["Content-Disposition", "Content-Length"]
+        if warnings:
+            import json
+            import urllib.parse
+
+            headers["X-Export-Warnings"] = urllib.parse.quote(json.dumps(warnings))
+            expose_headers.append("X-Export-Warnings")
+        if manual_fields:
+            import json
+            import urllib.parse
+
+            headers["X-Export-Manual"] = urllib.parse.quote(json.dumps(manual_fields))
+            expose_headers.append("X-Export-Manual")
+
+        headers["Access-Control-Expose-Headers"] = ", ".join(expose_headers)
+
+        return StreamingResponse(
+            io.BytesIO(docx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers=headers,
+        )
+
+    @app.get("/api/diagnostics")
+    async def get_diagnostics() -> Dict[str, Any]:
+        """Liefert umfassende Diagnose-Informationen für Debugging und Monitoring."""
+        plan_fn = bot.plan_data.filename if bot.plan_data else (bot.plan_info.get("filename") if bot.plan_info else None)
+        plan_gc = bot.plan_data.goals_count if bot.plan_data else (bot.plan_info.get("goals_count", 0) if bot.plan_info else 0)
+        return {
+            "pid": os.getpid(),
+            "cwd": str(Path.cwd()),
+            "python": sys.version,
+            "active_model": bot.model_info,
+            "models_found": bot.get_available_models(),
+            "search_paths": [str(d) for d in get_candidate_model_directories()],
+            "has_csv": bot.csv_data is not None,
+            "has_plan": bot.has_plan,
+            "plan_filename": plan_fn,
+            "plan_goals_count": plan_gc,
+            "history_length": len(bot.messages),
+            "recent_logs": get_recent_logs(max_lines=30),
+        }
+
+    @app.get("/api/logs", response_class=PlainTextResponse)
+    async def get_logs() -> str:
+        """Gibt die aktuellen Diagnose-Logs als Klartext zurück."""
+        return get_recent_logs(max_lines=200)
+
+    @app.get("/api/session")
+    async def get_session() -> Dict[str, Any]:
+        """Gibt den aktuellen Status der Sitzung (Modell, CSV, Plan und Verlauf) zurück."""
+        bot.check_ttl()
+        closed_reason = bot.pop_case_closed_reason()
+
+        has_csv = bot.csv_data is not None
+        csv_info = None
+        if bot.csv_data:
+            client_name = getattr(bot.csv_data, "client_name", "") or "Klient*in (anonymisiert)"
+            is_vivendi = bool(getattr(bot.csv_data, "entries", None)) or ("vivendi" in bot.csv_data.filename.lower())
+            source = "Vivendi PD Verlaufsbericht" if is_vivendi else f"Verlaufsdokumentation ({bot.csv_data.filename})"
+            csv_info = {
+                "filename": bot.csv_data.filename,
+                "total_rows": bot.csv_data.total_rows,
+                "entries_total": getattr(bot.csv_data, "entries_total", bot.csv_data.total_rows),
+                "entries_in_context": getattr(bot.csv_data, "entries_in_context", bot.csv_data.total_rows),
+                "oldest_included_date": getattr(bot.csv_data, "oldest_included_date", ""),
+                "headers": bot.csv_data.headers,
+                "preview": bot.csv_data.to_context_text(max_rows=3, update_counters=False),
+                "client_name": client_name,
+                "source": source,
+            }
+
+        has_plan = bot.has_plan
+        plan_info = None
+        plan_filename = None
+        plan_goals_count = 0
+
+        if has_plan:
+            if bot.plan_data:
+                plan_filename = bot.plan_data.filename
+                plan_goals_count = bot.plan_data.goals_count
+                plan_info = {
+                    "has_plan": True,
+                    "filename": bot.plan_data.filename,
+                    "client_name": bot.plan_data.client_name,
+                    "zeitraum_von": bot.plan_data.zeitraum_von,
+                    "zeitraum_bis": bot.plan_data.zeitraum_bis,
+                    "goals_count": bot.plan_data.goals_count,
+                    "preview": bot.plan_data.preview,
+                    "goals": [g.to_dict() for g in bot.plan_data.goals],
+                    "info": {
+                        "filename": bot.plan_data.filename,
+                        "client_name": bot.plan_data.client_name,
+                        "goals_count": bot.plan_data.goals_count,
+                    },
+                }
+            else:
+                plan_filename = bot.plan_info.get("filename") or bot.plan_info.get("title") or "Plan"
+                plan_goals_count = bot.plan_info.get("goals_count", 0)
+                plan_info = {
+                    "has_plan": True,
+                    "filename": plan_filename,
+                    "client_name": bot.plan_info.get("client_name", ""),
+                    "zeitraum_von": bot.plan_info.get("zeitraum_von", ""),
+                    "zeitraum_bis": bot.plan_info.get("zeitraum_bis", ""),
+                    "goals_count": plan_goals_count,
+                    "preview": (bot.plan_context[:300] + "...") if bot.plan_context and len(bot.plan_context) > 300 else (bot.plan_context or ""),
+                    "goals": [],
+                    "info": bot.plan_info,
+                }
+
+        is_heuristic = isinstance(bot.provider, ReflectionEngine) if bot.provider else False
+        kv_warning = getattr(bot.provider, "kv_clear_warning", None) if bot.provider else None
+
+        return {
+            "fall_id": bot.case.fall_id,
+            "case_closed_reason": closed_reason,
+            "model_error": bot.model_error,
+            "is_heuristic": is_heuristic,
+            "kv_clear_warning": kv_warning,
+            "start_check_skipped": os.getenv("SOB_SKIP_START_CHECK") == "1",
+            "has_csv": has_csv,
+            "has_plan": has_plan,
+            "plan_filename": plan_filename,
+            "plan_goals_count": plan_goals_count,
+            "csv": csv_info,
+            "plan": plan_info,
+            "model": bot.model_info,
+            "messages": bot.get_history(),
+        }
+
+    @app.post("/api/reset-chat")
+    async def reset_chat() -> Dict[str, bool]:
+        """Leert nur den Chatverlauf."""
+        bot.clear_history()
+        return {"success": True}
+
+    @app.post("/api/reset-csv")
+    async def reset_csv() -> Dict[str, bool]:
+        """Entfernt die geladene CSV-Datei."""
+        bot.set_csv(None)
+        return {"success": True}
+
+    @app.post("/api/reset")
+    async def reset_all() -> Dict[str, bool]:
+        """Setzt Chat, CSV und Vorbericht zurück."""
+        bot.clear()
+        return {"success": True}
+
+    return app

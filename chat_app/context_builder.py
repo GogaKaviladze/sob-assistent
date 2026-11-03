@@ -34,6 +34,8 @@ _BIDI_AND_ZERO_WIDTH_RE = re.compile(
 HAMBURG_TITLES: Dict[str, str] = {s.id: s.title for s in SECTION_DEFINITIONS}
 ODW_TITLES: Dict[str, str] = {s.id: s.title for s in OP_DE_WISCH_SECTION_DEFINITIONS}
 
+FREITEXT_FALLBACK_PREFIX = "⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:"
+
 
 def sanitize_for_prompt(text: str) -> str:
     """Bereinigt Eingaben vor dem Einfügen in Prompt-Datenblöcke.
@@ -160,7 +162,12 @@ class ContextBuilder:
                     vorbericht_lines.append(f"• Realisierung durch andere: {sanitize_for_prompt(g.realisierung_andere)}")
 
         if not vorbericht_lines:
-            vorbericht_text = "Keine Vorbericht-Ziele für diesen Lebensbereich erfasst."
+            if not (case.plan and getattr(case.plan, "goals", None)) and getattr(case, "plan_context", None) and case.plan_context.strip():
+                vorbericht_text = f"{FREITEXT_FALLBACK_PREFIX}\n{sanitize_for_prompt(case.plan_context.strip())}"
+            elif case.plan and getattr(case.plan, "parser_source", "") == "text_plan" and getattr(case.plan, "raw_summary", None) and case.plan.raw_summary.strip():
+                vorbericht_text = f"{FREITEXT_FALLBACK_PREFIX}\n{sanitize_for_prompt(case.plan.raw_summary.strip())}"
+            else:
+                vorbericht_text = "Keine Vorbericht-Ziele für diesen Lebensbereich erfasst."
         else:
             vorbericht_text = "\n".join(vorbericht_lines)
 
@@ -316,6 +323,19 @@ class ContextBuilder:
                 if getattr(g, "realisierung_andere", ""):
                     text_lines.append(f"Realisierung durch andere: {g.realisierung_andere}")
                 alt_sob["text"] = "\n".join(text_lines)
+
+        if not alt_sob["has_goals"]:
+            fallback_txt = ""
+            if not (case.plan and getattr(case.plan, "goals", None)) and getattr(case, "plan_context", None) and case.plan_context.strip():
+                fallback_txt = case.plan_context.strip()
+            elif case.plan and getattr(case.plan, "parser_source", "") == "text_plan" and getattr(case.plan, "raw_summary", None) and case.plan.raw_summary.strip():
+                fallback_txt = case.plan.raw_summary.strip()
+            if fallback_txt:
+                prefixed = f"{FREITEXT_FALLBACK_PREFIX}\n{fallback_txt}"
+                alt_sob["has_goals"] = True
+                alt_sob["is_freitext_fallback"] = True
+                alt_sob["leitziel"] = prefixed
+                alt_sob["text"] = prefixed
 
         # 2. CSV-Einträge
         assigned_entries: List[Dict[str, Any]] = []

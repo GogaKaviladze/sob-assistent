@@ -440,3 +440,112 @@ def test_area_review_shows_assigned_entries_and_alt_sob():
     client.post("/api/area/confirm", json={"bereich_id": "1.1"})
     res_after = client.get("/api/area/1.1/review")
     assert res_after.json()["confirmed"] is True
+
+
+# ===========================================================================
+# 6. Issue #23 & PR #24 Review-Befunde: Validierung, Vorbericht-Text, Vorlagen-Check, UI-Fehleranzeige
+# ===========================================================================
+
+@pytest.mark.parametrize("invalid_id", ["99.9", "1.9", "evil_input_ZZ_SYNTH"])
+def test_get_area_review_invalid_id_returns_422_no_leak(invalid_id, caplog):
+    """Punkt 1: GET /api/area/{bereich_id}/review mit ungültiger ID liefert 422 (nie 500) und loggt keinen Rohwert."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    with caplog.at_level(logging.DEBUG, logger="chat_app"):
+        res = client.get(f"/api/area/{invalid_id}/review")
+
+    assert res.status_code == 422
+    assert invalid_id not in res.text
+    assert invalid_id not in caplog.text
+
+
+def test_area_compatibility_checked_on_review_and_confirm():
+    """Befund 3: Vorlagen-Kompatibilität wird auch in GET /api/area/{id}/review, POST /api/area/review und POST /api/area/confirm geprüft (422 mit ❌)."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. Op-de-Wisch Plan setzen (IDs "1", "2", "4")
+    bot.set_plan(
+        PlanData(
+            filename="odw.docx",
+            goals=[PlanGoalItem(section_id="4", section_title="Wohnen", leitziel="ZZ_SYNTH_ODW_4")],
+        )
+    )
+
+    for endpoint_call in [
+        lambda: client.get("/api/area/1.1/review"),
+        lambda: client.post("/api/area/review", json={"bereich_id": "1.1"}),
+        lambda: client.post("/api/area/confirm", json={"bereich_id": "1.1"}),
+        lambda: client.post("/api/area", json={"bereich_id": "1.1"}),
+    ]:
+        res = endpoint_call()
+        assert res.status_code == 422
+        assert "❌" in res.json()["detail"]
+
+    # Gültige OdW-ID funktioniert
+    assert client.get("/api/area/4/review").status_code == 200
+    assert client.post("/api/area/review", json={"bereich_id": "4"}).status_code == 200
+    assert client.post("/api/area/confirm", json={"bereich_id": "4"}).status_code == 200
+
+    # 2. Hamburger Plan setzen (ID "1.1") -> OdW-ID "4" muss 422 liefern
+    bot.set_plan(
+        PlanData(
+            filename="hh.docx",
+            goals=[PlanGoalItem(section_id="1.1", section_title="Wohnen", leitziel="ZZ_SYNTH_HH_1_1")],
+        )
+    )
+    for endpoint_call in [
+        lambda: client.get("/api/area/4/review"),
+        lambda: client.post("/api/area/review", json={"bereich_id": "4"}),
+        lambda: client.post("/api/area/confirm", json={"bereich_id": "4"}),
+        lambda: client.post("/api/area", json={"bereich_id": "4"}),
+    ]:
+        res = endpoint_call()
+        assert res.status_code == 422
+        assert "❌" in res.json()["detail"]
+
+
+def test_context_builder_includes_accepted_text_plan_in_build_and_review():
+    """Befund 2 & Review-Korrektur 3: Akzeptierter Text-Vorbericht wird in ContextBuilder.build und get_review_data eingebunden; beim Freitext-Fallback für andere Bereiche wird er sichtbar mit '⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:' gekennzeichnet."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    plan_text = "Bereich 1.1 Wohnsituation\nLeitziel: ZZ_SYNTH_TEXT_PLAN_1_1 Eigene Wohnung selbstständig erhalten."
+    res_plan = client.post("/api/plan", json={"plan_text": plan_text, "filename": "vorbericht.txt"})
+    assert res_plan.status_code == 200
+
+    # 1. Bereich 1.1 hat ein direkt zugeordnetes Ziel
+    built_1_1 = ContextBuilder.build(bot.case, "1.1")
+    assert "ZZ_SYNTH_TEXT_PLAN_1_1" in built_1_1.vorbericht_bereich
+
+    # 2. Bereich 1.2 hat kein eigenes Ziel im Text-Vorbericht -> Freitext-Fallback mit sichtbarem ⚠️-Präfix in Prompt & Review
+    built_1_2 = ContextBuilder.build(bot.case, "1.2")
+    assert "⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:" in built_1_2.vorbericht_bereich
+    assert "ZZ_SYNTH_TEXT_PLAN_1_1" in built_1_2.vorbericht_bereich
+
+    res_rev_1_2 = client.get("/api/area/1.2/review")
+    assert res_rev_1_2.status_code == 200
+    rev_data = res_rev_1_2.json()
+    assert rev_data["alt_sob"]["has_goals"] is True
+    assert "⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:" in rev_data["alt_sob"]["text"]
+    assert "⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:" in rev_data["alt_sob"]["leitziel"]
+    assert "ZZ_SYNTH_TEXT_PLAN_1_1" in rev_data["alt_sob"]["text"]
+
+
+def test_ui_upload_error_banner_present_in_index_html():
+    """Punkt 3: templates/index.html zeigt Upload-Fehler (Status >= 400) sichtbar im Upload-Bereich an (CSV und Vorbericht) und hat einen funktionierenden Schließen-Button im Modal."""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parents[1] / "chat_app" / "templates" / "index.html").read_text(encoding="utf-8")
+
+    # Sichtbare Fehlerboxen im Upload-Bereich für CSV und Vorbericht
+    assert 'id="csvUploadError"' in html
+    assert 'id="planUploadError"' in html
+    # Status >= 400 / !res.ok Prüfung in beiden Upload-Handlern
+    assert "res.status >= 400" in html or "!res.ok" in html
+    # Modal nutzt konsistent 'active' statt 'open'
+    assert "modal.classList.add('open')" not in html
+

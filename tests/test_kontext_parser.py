@@ -252,3 +252,83 @@ def test_upload_plan_fallback_returns_visible_warning(test_client):
     assert session_data["has_plan"] is True
     assert session_data["plan"]["is_fallback"] is True
     assert "⚠️" in session_data["plan"]["warning"]
+
+
+@pytest.mark.parametrize("ext,mime", [(".txt", "text/plain"), (".md", "text/markdown")])
+def test_upload_plan_txt_and_md_fail_closed_when_zero_goals(test_client, ext, mime):
+    """Punkt 2: Fail-closed für .txt und .md bei 0 erkannten Zielen/Bereichen -> 422 mit '❌ Kein gültiger Vorbericht erkannt…'."""
+    content = b"Kaffee kochen und Zeitung lesen ohne jegliche Ziele oder Lebensbereiche."
+    res = test_client.post(
+        "/api/upload-plan",
+        files={"file": (f"notiz{ext}", io.BytesIO(content), mime)},
+    )
+    assert res.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res.json()["detail"]
+
+
+def test_post_api_plan_fail_closed_when_zero_goals(test_client):
+    """Punkt 2: Fail-closed für POST /api/plan bei 0 erkannten Zielen/Bereichen -> 422 mit '❌ Kein gültiger Vorbericht erkannt…'."""
+    res = test_client.post(
+        "/api/plan",
+        json={"plan_text": "Beliebiger Text ohne erkennbare Ziele oder Lebensbereiche.", "filename": "notiz.txt"},
+    )
+    assert res.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res.json()["detail"]
+
+
+def test_upload_plan_txt_and_post_plan_succeed_with_valid_goals(test_client):
+    """Punkt 2 & Befund 2: Text-/Markdown-Pläne mit erkennbaren Zielen/Bereichen werden akzeptiert, liefern goals_count > 0 sowie is_fallback=True und eine sichtbare Warnung."""
+    valid_text = "Bereich 1.1 Wohnsituation\nLeitziel: ZZ_SYNTH_TXT_GOAL Erhalt der eigenen Wohnung."
+    res_upload = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("vorbericht.txt", io.BytesIO(valid_text.encode("utf-8")), "text/plain")},
+    )
+    assert res_upload.status_code == 200
+    data_up = res_upload.json()
+    assert data_up["goals_count"] >= 1
+    assert data_up["is_fallback"] is True
+    assert "⚠️" in data_up.get("warning", "")
+    assert data_up.get("parser_source") == "text_plan"
+
+    res_api = test_client.post(
+        "/api/plan",
+        json={"plan_text": valid_text, "filename": "plan.md"},
+    )
+    assert res_api.status_code == 200
+    data_api = res_api.json()
+    assert data_api["goals_count"] >= 1
+    assert data_api["is_fallback"] is True
+    assert "⚠️" in data_api.get("warning", "")
+    assert data_api.get("parser_source") == "text_plan"
+
+
+def test_parse_plan_text_no_silent_fallback_to_1_1_and_rejects_arbitrary_numbered_lines(test_client):
+    """Review-Korrektur 1: Ziel-Zeilen ohne Bereichsüberschrift werden nicht still '1.1' zugeordnet (422 ❌); beliebige nummerierte Zeilen ('2 Termine wahrgenommen') gelten nicht als Bereich."""
+    # 1. Ziel-Zeile ohne Bereichsüberschrift -> 0 Ziele -> 422 ❌
+    no_section_text = "Leitziel: ZZ_SYNTH_ORPHAN_GOAL Wohnung sauber halten ohne Bereich."
+    res_no_sec = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("orphan.txt", io.BytesIO(no_section_text.encode("utf-8")), "text/plain")},
+    )
+    assert res_no_sec.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res_no_sec.json()["detail"]
+
+    # 2. Beliebige nummerierte Zeile ('2 Termine wahrgenommen') oder ungültige ID ('Bereich 9.9') -> 0 Ziele -> 422 ❌
+    numbered_prose = "2 Termine wahrgenommen und eingekauft.\nBereich 9.9 Unbekannt\nLeitziel: Sollte nicht zugeordnet werden."
+    res_prose = test_client.post(
+        "/api/plan",
+        json={"plan_text": numbered_prose, "filename": "notiz.txt"},
+    )
+    assert res_prose.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res_prose.json()["detail"]
+
+    # 3. Gültige Op-de-Wisch Bereichsüberschrift ('Bereich 4: Wohnen') wird akzeptiert
+    valid_odw = "Bereich 4: Wohnen\nLeitziel: ZZ_SYNTH_ODW_4 Eigene Wohnung gestalten."
+    res_odw = test_client.post(
+        "/api/plan",
+        json={"plan_text": valid_odw, "filename": "odw.txt"},
+    )
+    assert res_odw.status_code == 200
+    assert res_odw.json()["goals_count"] == 1
+
+

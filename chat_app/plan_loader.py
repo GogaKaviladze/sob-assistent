@@ -16,6 +16,7 @@ from typing import Any, BinaryIO, Dict, List, Optional, Union
 from sob_generator import docx_fields as fields
 from sob_generator.docx_safety import SafeDocx, sanitize_docx_bytes
 from sob_generator.llm.sections import SECTION_DEFINITIONS
+from sob_generator.llm.sections_op_de_wisch import OP_DE_WISCH_SECTION_DEFINITIONS
 from sob_generator.previous_sob import IncompletePlanError
 
 from .logger import logger
@@ -502,3 +503,134 @@ def parse_plan_docx(
         warning=warning,
         parser_source=parser_source,
     )
+
+
+def parse_plan_text(text: str, filename: str = "vorbericht.txt") -> PlanData:
+    """Liest einen Freitext- oder Markdown-Vorbericht (.txt, .md, POST /api/plan) ein und extrahiert Ziele/Lebensbereiche."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    client_name = ""
+    zeitraum_von = ""
+    zeitraum_bis = ""
+    extracted_goals: List[PlanGoalItem] = []
+
+    hamburg_title_map = {d.id: d.title for d in SECTION_DEFINITIONS}
+    odw_title_map = {d.id: d.title for d in OP_DE_WISCH_SECTION_DEFINITIONS}
+    section_title_map = {**odw_title_map, **hamburg_title_map}
+    valid_section_ids = set(section_title_map.keys())
+
+    heading_re = re.compile(
+        r"^((?:#{1,4}\s*)?(?:(?:Lebens)?Bereich\s+|Abschnitt\s+)?|#{1,4}\s+)(\d+(?:\.\d+)?)\b([:\.\s–\-]*)(.*)$",
+        re.IGNORECASE,
+    )
+    kw_re = re.compile(
+        r"(?i)^(?:[#*\-•]+\s*)?(?:(?:alte|bisherige|aktuelle|neue|vereinbarte)\s+)?(leitziel(?:e)?|teilziel(?:e)?|smart(?:e\s+ziele)?|ziel(?:vereinbarung|erreichung|e)?(?:\s*\d+)?|stand(?:\s+der\s+zielerreichung)?|maßnahmen|massnahmen)\b\s*[:\-]\s*(.+)"
+    )
+
+    curr_sec_id = ""
+    curr_sec_title = ""
+
+    def _append_goal_field(sec_id: str, sec_title: str, kw_type: str, val: str) -> None:
+        existing = next((g for g in extracted_goals if g.section_id == sec_id), None)
+        if existing is None:
+            existing = PlanGoalItem(section_id=sec_id, section_title=sec_title, applies=True)
+            extracted_goals.append(existing)
+        if "smart" in kw_type or "teilziel" in kw_type:
+            existing.smarte_ziele = f"{existing.smarte_ziele}\n{val}".strip() if existing.smarte_ziele else val
+        elif "stand" in kw_type or "erreichung" in kw_type:
+            existing.stand_zielerreichung = f"{existing.stand_zielerreichung}\n{val}".strip() if existing.stand_zielerreichung else val
+        elif "maßnahme" in kw_type or "massnahme" in kw_type:
+            existing.vorschlag_massnahmen = f"{existing.vorschlag_massnahmen}\n{val}".strip() if existing.vorschlag_massnahmen else val
+        else:
+            existing.leitziel = f"{existing.leitziel}\n{val}".strip() if existing.leitziel else val
+
+    for line in lines:
+        if not client_name:
+            m_cl = re.search(r"(?i)^(?:Klient(?:in|\*in)?|Name|Betreute Person)\s*:\s*(.+)$", line)
+            if m_cl:
+                client_name = m_cl.group(1).strip()
+                continue
+
+        m_zr = re.search(r"(\d{2}\.\d{2}\.\d{4})\s*(?:bis|-)\s*(\d{2}\.\d{2}\.\d{4})", line, re.IGNORECASE)
+        if m_zr and not (zeitraum_von or zeitraum_bis):
+            zeitraum_von, zeitraum_bis = m_zr.group(1), m_zr.group(2)
+
+        m_h = heading_re.match(line)
+        if m_h and not kw_re.match(line):
+            prefix = (m_h.group(1) or "").strip()
+            cand_id = m_h.group(2)
+            sep = m_h.group(3) or ""
+            rest = m_h.group(4).strip(" :–-")
+
+            if cand_id in valid_section_ids:
+                # Einstellige IDs (Op-de-Wisch 1..9) nur akzeptieren, wenn explizites Präfix (#, Bereich, Abschnitt)
+                # oder kanonischer Bereichstitel vorliegt (verhindert '2 Termine wahrgenommen' als Bereich 2).
+                is_valid_heading = False
+                if "." in cand_id or prefix:
+                    is_valid_heading = True
+                elif cand_id in odw_title_map and rest:
+                    canon_low = odw_title_map[cand_id].lower()
+                    rest_low = rest.lower()
+                    if (":" in sep or "." in sep) and (rest_low in canon_low or canon_low in rest_low):
+                        is_valid_heading = True
+
+                if is_valid_heading:
+                    curr_sec_id = cand_id
+                    inline_kw = kw_re.match(rest) if rest else None
+                    if inline_kw:
+                        curr_sec_title = section_title_map.get(cand_id, f"Bereich {cand_id}")
+                        _append_goal_field(
+                            curr_sec_id,
+                            curr_sec_title,
+                            inline_kw.group(1).lower(),
+                            inline_kw.group(2).strip() or rest,
+                        )
+                    else:
+                        curr_sec_title = rest or section_title_map.get(cand_id, f"Bereich {cand_id}")
+                    continue
+            else:
+                # Ungültige Bereichs-ID (z. B. 9.9) setzt aktuellen Bereich zurück
+                if prefix or "." in cand_id:
+                    curr_sec_id = ""
+                    curr_sec_title = ""
+                    continue
+
+        m_kw = kw_re.search(line)
+        if m_kw:
+            # Kein stiller Fallback auf '1.1': ohne erkannte Bereichsüberschrift nicht zuordnen
+            if not curr_sec_id:
+                continue
+            kw_type = m_kw.group(1).lower()
+            val = m_kw.group(2).strip() or line
+            sec_title = curr_sec_title or section_title_map.get(curr_sec_id, f"Bereich {curr_sec_id}")
+            _append_goal_field(curr_sec_id, sec_title, kw_type, val)
+        elif curr_sec_id:
+            existing = next((g for g in extracted_goals if g.section_id == curr_sec_id), None)
+            if existing is None:
+                existing = PlanGoalItem(section_id=curr_sec_id, section_title=curr_sec_title, leitziel=line, applies=True)
+                extracted_goals.append(existing)
+            else:
+                existing.leitziel = f"{existing.leitziel}\n{line}".strip() if existing.leitziel else line
+
+    client_name_from_filename = False
+    if not client_name:
+        client_name = extract_client_name_from_filename(filename)
+        client_name_from_filename = bool(client_name)
+
+    warning = (
+        "⚠️ Vorbericht wurde über Text-Heuristik (Fallback) eingelesen. "
+        "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
+    )
+
+    return PlanData(
+        filename=filename,
+        client_name=client_name,
+        client_name_from_filename=client_name_from_filename,
+        zeitraum_von=zeitraum_von,
+        zeitraum_bis=zeitraum_bis,
+        goals=extracted_goals,
+        raw_summary=(text or "").strip(),
+        is_fallback=True,
+        warning=warning,
+        parser_source="text_plan",
+    )
+

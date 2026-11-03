@@ -1018,6 +1018,7 @@
           <p><strong>CSV hier ablegen</strong><br>oder zum Hochladen klicken</p>
           <input type="file" id="csvFileInput" accept=".csv" onchange="handleFileSelected(this.files)">
         </div>
+        <div id="csvUploadError" role="alert" style="display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-size: 0.8rem; line-height: 1.4;"></div>
       </div>
 
       <div class="csv-card" id="csvCard">
@@ -1053,6 +1054,7 @@
           <p><strong>DOCX-Vorbericht hier ablegen</strong><br>oder zum Hochladen klicken</p>
           <input type="file" id="planFileInput" accept=".docx" onchange="handlePlanFileSelected(this.files)">
         </div>
+        <div id="planUploadError" role="alert" style="display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-size: 0.8rem; line-height: 1.4;"></div>
       </div>
 
       <div class="plan-card" id="planCard">
@@ -1517,23 +1519,27 @@
           if (data.alt_sob && data.alt_sob.has_goals) {
             let html = '';
             const g = data.alt_sob;
-            if (g.leitziel) {
-              html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Leitziel:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.leitziel)}</span></div>`;
-            }
-            if (g.smarte_ziele) {
-              html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Smartes Ziel:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.smarte_ziele)}</span></div>`;
-            }
-            if (g.stand_zielerreichung) {
-              html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Bisherige Zielerreichung / Reflexion:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.stand_zielerreichung)}</span></div>`;
-            }
-            if (g.vorschlag_ziele) {
-              html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Vorschlag für aktuelle Ziele:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.vorschlag_ziele)}</span></div>`;
-            }
-            if (g.vorschlag_massnahmen) {
-              html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Vorschlag Maßnahmen:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.vorschlag_massnahmen)}</span></div>`;
-            }
-            if (g.realisierung_andere) {
-              html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Realisierung durch andere:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.realisierung_andere)}</span></div>`;
+            if (g.is_freitext_fallback) {
+              html += `<div style="margin-bottom: 6px; color: #f59e0b; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 6px; padding: 8px 10px; white-space: pre-wrap;">${escapeHtml(g.text || g.leitziel)}</div>`;
+            } else {
+              if (g.leitziel) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Leitziel:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.leitziel)}</span></div>`;
+              }
+              if (g.smarte_ziele) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Smartes Ziel:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.smarte_ziele)}</span></div>`;
+              }
+              if (g.stand_zielerreichung) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Bisherige Zielerreichung / Reflexion:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.stand_zielerreichung)}</span></div>`;
+              }
+              if (g.vorschlag_ziele) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Vorschlag für aktuelle Ziele:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.vorschlag_ziele)}</span></div>`;
+              }
+              if (g.vorschlag_massnahmen) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Vorschlag Maßnahmen:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.vorschlag_massnahmen)}</span></div>`;
+              }
+              if (g.realisierung_andere) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Realisierung durch andere:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.realisierung_andere)}</span></div>`;
+              }
             }
             altSobEl.innerHTML = html;
           } else {
@@ -1758,9 +1764,28 @@
       if (modal && titleEl && msgEl) {
         titleEl.textContent = title;
         msgEl.textContent = message;
-        modal.classList.add('open');
+        modal.classList.add('active');
       } else {
         alert(title + ": " + message);
+      }
+    }
+
+    function setUploadBannerError(elementId, rawMessage) {
+      const el = document.getElementById(elementId);
+      const msg = String(rawMessage || "Upload fehlgeschlagen").trim();
+      const formatted = msg.startsWith("❌") ? msg : `❌ ${msg}`;
+      if (el) {
+        el.textContent = formatted;
+        el.style.display = 'block';
+      }
+      return formatted;
+    }
+
+    function clearUploadBannerError(elementId) {
+      const el = document.getElementById(elementId);
+      if (el) {
+        el.textContent = '';
+        el.style.display = 'none';
       }
     }
 
@@ -1786,35 +1811,40 @@
             return;
           }
         }
-        const data = await res.json();
-        if (data.success) {
-          if (newCase) {
-            // Bei neuem Fall UI vorab leeren
-            if (messagesContainer) messagesContainer.innerHTML = '';
-            removePlanUI();
-          }
-          updateCsvUI(
-            data.filename,
-            data.total_rows,
-            data.headers,
-            data.preview,
-            data.client_name,
-            data.source,
-            data.entries_total,
-            data.entries_in_context,
-            data.oldest_included_date
-          );
-          const notifCount = (data.entries_in_context !== undefined && data.entries_total !== undefined && data.entries_in_context < data.entries_total)
-            ? ` (${data.entries_in_context} von ${data.entries_total} Einträgen im Kontext)`
-            : ` (${data.entries_total || data.total_rows} Einträge aktiv)`;
-          appendSystemNotification(
-            `✅ CSV '${data.filename}' erfolgreich geladen${notifCount}`
-          );
-        } else {
-          showModalError("Fehler beim Laden", data.detail || data.error || "Unbekannter Fehler");
+        const data = await res.json().catch(() => ({}));
+        if (res.status >= 400 || !data.success) {
+          const errMsg = setUploadBannerError('csvUploadError', data.detail || data.error || `Server-Fehler (${res.status})`);
+          showModalError("Fehler beim Laden", errMsg);
+          if (csvFileInput) csvFileInput.value = "";
+          return;
         }
+        clearUploadBannerError('csvUploadError');
+        if (newCase) {
+          // Bei neuem Fall UI vorab leeren
+          if (messagesContainer) messagesContainer.innerHTML = '';
+          removePlanUI();
+        }
+        updateCsvUI(
+          data.filename,
+          data.total_rows,
+          data.headers,
+          data.preview,
+          data.client_name,
+          data.source,
+          data.entries_total,
+          data.entries_in_context,
+          data.oldest_included_date
+        );
+        const notifCount = (data.entries_in_context !== undefined && data.entries_total !== undefined && data.entries_in_context < data.entries_total)
+          ? ` (${data.entries_in_context} von ${data.entries_total} Einträgen im Kontext)`
+          : ` (${data.entries_total || data.total_rows} Einträge aktiv)`;
+        appendSystemNotification(
+          `✅ CSV '${data.filename}' erfolgreich geladen${notifCount}`
+        );
       } catch (err) {
-        showModalError("Upload fehlgeschlagen", err.message);
+        const errMsg = setUploadBannerError('csvUploadError', err.message);
+        showModalError("Upload fehlgeschlagen", errMsg);
+        if (csvFileInput) csvFileInput.value = "";
       }
     }
 
@@ -1916,7 +1946,8 @@
       const file = files[0];
       const lower = file.name.toLowerCase();
       if (!lower.endsWith('.docx') && !lower.endsWith('.txt') && !lower.endsWith('.md')) {
-        alert("Bitte eine .docx, .txt oder .md Datei auswählen.");
+        const errMsg = setUploadBannerError('planUploadError', "Bitte eine .docx, .txt oder .md Datei auswählen.");
+        showModalError("Ungültiges Dateiformat", errMsg);
         return;
       }
       const formData = new FormData();
@@ -1938,26 +1969,29 @@
             return;
           }
         }
-        const data = await res.json();
-        if (data.success) {
-          if (newCase) {
-            if (messagesContainer) messagesContainer.innerHTML = '';
-            removeCsvUI();
-          }
-          const period = (data.zeitraum_von || data.zeitraum_bis)
-            ? `${data.zeitraum_von || ''} bis ${data.zeitraum_bis || ''}`.trim()
-            : (data.zeitraum || '');
-          updatePlanUI(data.filename, data.goals_count, data.client_name, data.preview, period, data.hidden_removed, data.warning, data.is_fallback);
-          appendSystemNotification(
-            `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
-          );
-          showToast(`✓ Vorbericht geladen: ${data.filename}`);
-        } else {
-          showModalError("Fehler beim Vorbericht-Laden", data.detail || data.error || "Unbekannter Fehler");
+        const data = await res.json().catch(() => ({}));
+        if (res.status >= 400 || !data.success) {
+          const errMsg = setUploadBannerError('planUploadError', data.detail || data.error || `Server-Fehler (${res.status})`);
+          showModalError("Fehler beim Vorbericht-Laden", errMsg);
           if (planFileInput) planFileInput.value = "";
+          return;
         }
+        clearUploadBannerError('planUploadError');
+        if (newCase) {
+          if (messagesContainer) messagesContainer.innerHTML = '';
+          removeCsvUI();
+        }
+        const period = (data.zeitraum_von || data.zeitraum_bis)
+          ? `${data.zeitraum_von || ''} bis ${data.zeitraum_bis || ''}`.trim()
+          : (data.zeitraum || '');
+        updatePlanUI(data.filename, data.goals_count, data.client_name, data.preview, period, data.hidden_removed, data.warning, data.is_fallback);
+        appendSystemNotification(
+          `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
+        );
+        showToast(`✓ Vorbericht geladen: ${data.filename}`);
       } catch (err) {
-        showModalError("Upload fehlgeschlagen", err.message);
+        const errMsg = setUploadBannerError('planUploadError', err.message);
+        showModalError("Upload fehlgeschlagen", errMsg);
         if (planFileInput) planFileInput.value = "";
       }
     }

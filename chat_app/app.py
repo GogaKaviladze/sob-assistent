@@ -38,6 +38,7 @@ from .plan_loader import (
     PlanData,
     extract_client_name_from_filename,
     parse_plan_docx,
+    parse_plan_text,
 )
 from .upload_limits import (
     LimitUploadSizeMiddleware,
@@ -71,6 +72,27 @@ ValidAreaId = Literal[
 
 class SelectAreaRequest(BaseModel):
     bereich_id: ValidAreaId
+
+
+def _validate_area_compatibility(bot: ReflectionChatbot, bereich_id: str) -> None:
+    """Prüft, ob die gewählte Bereichs-ID zur geladenen Vorbericht-Vorlage passt (Befund 3)."""
+    is_odw = bool(
+        bot.plan_data
+        and any(
+            getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+            for g in getattr(bot.plan_data, "goals", [])
+        )
+    )
+    if is_odw and bereich_id in {"1.1", "1.2", "1.3", "1.4", "1.5", "2.1", "2.2", "2.3"}:
+        raise HTTPException(
+            status_code=422,
+            detail="❌ Ungültiger Lebensbereich für geladene Op de Wisch Vorlage.",
+        )
+    if not is_odw and bot.plan_data and bereich_id in {"1", "2", "4", "5", "6", "7", "8", "9"}:
+        raise HTTPException(
+            status_code=422,
+            detail="❌ Ungültiger Lebensbereich für Hamburger Vorlage.",
+        )
 
 
 DEFAULT_DOCX_PARSE_TIMEOUT = 10.0
@@ -154,6 +176,15 @@ def create_app(
 
         try:
             parsed_csv = parse_csv_content(content_text, filename=file.filename, client_name=client_name)
+        except ValueError as exc:
+            logger.warning("Fehler beim Parsen der CSV-Datei: %s", type(exc).__name__)
+            msg = str(exc)
+            if msg.startswith("❌"):
+                raise HTTPException(status_code=400, detail=msg) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=f"❌ CSV-Datei konnte nicht verarbeitet werden ({type(exc).__name__}).",
+            ) from exc
         except Exception as exc:
             logger.warning("Fehler beim Parsen der CSV-Datei: %s", type(exc).__name__)
             raise HTTPException(
@@ -320,6 +351,14 @@ def create_app(
                         detail=f"❌ Konnte Datei-Encoding nicht lesen ({type(exc).__name__}).",
                     ) from exc
 
+            parsed_text_plan = parse_plan_text(content_text, filename=file.filename)
+            if parsed_text_plan.goals_count == 0:
+                logger.warning("Kein Lebensbereich im Text-Vorbericht erkannt: goals_count=0")
+                raise HTTPException(
+                    status_code=422,
+                    detail="❌ Kein gültiger Vorbericht erkannt: Es konnten keine Lebensbereiche oder Ziele extrahiert werden.",
+                )
+
             if not new_case:
                 has_same_type = bot.has_plan
                 has_history = len(bot.messages) > 0
@@ -334,34 +373,30 @@ def create_app(
             else:
                 bot.hard_reset(reason="reset")
 
-            bot.set_plan_context(content_text, plan_info={"filename": file.filename})
+            bot.set_plan(parsed_text_plan)
+            bot.set_plan_context(content_text, plan_info={"filename": file.filename, "goals_count": parsed_text_plan.goals_count})
+            bot.plan_data = parsed_text_plan
+            log_plan_loaded(goals_count=parsed_text_plan.goals_count)
             return {
                 "success": True,
                 "has_plan": True,
                 "filename": file.filename,
-                "goals_count": 0,
-                "client_name": "",
-                "zeitraum_von": "",
-                "zeitraum_bis": "",
+                "goals_count": parsed_text_plan.goals_count,
+                "client_name": parsed_text_plan.client_name,
+                "zeitraum_von": parsed_text_plan.zeitraum_von,
+                "zeitraum_bis": parsed_text_plan.zeitraum_bis,
                 "preview": (bot.plan_context[:200] if bot.plan_context else ""),
+                "hidden_removed": getattr(parsed_text_plan, "hidden_removed", 0),
+                "is_fallback": getattr(parsed_text_plan, "is_fallback", True),
+                "warning": getattr(parsed_text_plan, "warning", ""),
+                "parser_source": getattr(parsed_text_plan, "parser_source", "text_plan"),
             }
 
     @app.post("/api/area")
     async def select_area(req: SelectAreaRequest) -> Dict[str, Any]:
         """Wählt den aktiven Lebensbereich für den Fachdialog aus (M5)."""
         bot.check_ttl()
-        # Prüfe Kompatibilität mit geladenem Vorbericht
-        is_odw = bool(
-            bot.plan_data
-            and any(
-                getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                for g in getattr(bot.plan_data, "goals", [])
-            )
-        )
-        if is_odw and req.bereich_id in {"1.1", "1.2", "1.3", "1.4", "1.5", "2.1", "2.2", "2.3"}:
-            raise HTTPException(status_code=422, detail="Ungültiger Lebensbereich für geladene Op de Wisch Vorlage.")
-        if not is_odw and bot.plan_data and req.bereich_id in {"1", "2", "4", "5", "6", "7", "8", "9"}:
-            raise HTTPException(status_code=422, detail="Ungültiger Lebensbereich für Hamburger Vorlage.")
+        _validate_area_compatibility(bot, req.bereich_id)
 
         bot.selected_bereich_id = req.bereich_id
         built = ContextBuilder.build(bot.case, req.bereich_id)
@@ -386,14 +421,14 @@ def create_app(
         }
 
     @app.get("/api/area/{bereich_id}/review")
-    async def review_area(bereich_id: str) -> Dict[str, Any]:
+    async def review_area(bereich_id: ValidAreaId) -> Dict[str, Any]:
         """Liefert die zugeordneten Verlaufs-Einträge und den Alt-SOB-Teil zur fachlichen Prüfung."""
         bot.check_ttl()
-        req = SelectAreaRequest(bereich_id=bereich_id)
-        review_data = ContextBuilder.get_review_data(bot.case, req.bereich_id)
+        _validate_area_compatibility(bot, bereich_id)
+        review_data = ContextBuilder.get_review_data(bot.case, bereich_id)
         logger.info(
             "Bereich zur Prüfung aufgerufen: %s (Doku: %d+%d)",
-            req.bereich_id,
+            bereich_id,
             review_data["assigned_count"],
             review_data["unassigned_count"],
         )
@@ -406,6 +441,7 @@ def create_app(
     async def review_area_post(req: SelectAreaRequest) -> Dict[str, Any]:
         """Liefert die zugeordneten Verlaufs-Einträge und den Alt-SOB-Teil via POST."""
         bot.check_ttl()
+        _validate_area_compatibility(bot, req.bereich_id)
         review_data = ContextBuilder.get_review_data(bot.case, req.bereich_id)
         logger.info(
             "Bereich zur Prüfung aufgerufen: %s (Doku: %d+%d)",
@@ -422,6 +458,7 @@ def create_app(
     async def confirm_area(req: SelectAreaRequest) -> Dict[str, Any]:
         """Setzt die fachliche Bestätigung 'Bereich geprüft' im RAM (Legal 1)."""
         bot.check_ttl()
+        _validate_area_compatibility(bot, req.bereich_id)
         bot.case.confirm_area(req.bereich_id)
         logger.info("Lebensbereich bestätigt: %s", req.bereich_id)
         return {
@@ -511,18 +548,33 @@ def create_app(
         if not req.plan_text.strip():
             raise HTTPException(status_code=400, detail="Plan-Text darf nicht leer sein.")
 
-        info = {}
+        parsed_text_plan = parse_plan_text(req.plan_text, filename=req.filename or "vorbericht.txt")
+        if parsed_text_plan.goals_count == 0:
+            logger.warning("Kein Lebensbereich in /api/plan erkannt: goals_count=0")
+            raise HTTPException(
+                status_code=422,
+                detail="❌ Kein gültiger Vorbericht erkannt: Es konnten keine Lebensbereiche oder Ziele extrahiert werden.",
+            )
+
+        info: Dict[str, Any] = {"goals_count": parsed_text_plan.goals_count}
         if req.filename:
             info["filename"] = req.filename
         if req.title:
             info["title"] = req.title
 
+        bot.set_plan(parsed_text_plan)
         bot.set_plan_context(req.plan_text, plan_info=info)
+        bot.plan_data = parsed_text_plan
         return {
             "success": True,
             "has_plan": True,
+            "goals_count": parsed_text_plan.goals_count,
             "plan_info": bot.plan_info,
             "preview": bot.plan_context[:200] if bot.plan_context else "",
+            "hidden_removed": getattr(parsed_text_plan, "hidden_removed", 0),
+            "is_fallback": getattr(parsed_text_plan, "is_fallback", True),
+            "warning": getattr(parsed_text_plan, "warning", ""),
+            "parser_source": getattr(parsed_text_plan, "parser_source", "text_plan"),
         }
 
     @app.post("/api/reset-plan")

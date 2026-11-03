@@ -33,6 +33,13 @@ class SlowMockLLM(LLMProvider):
     model_name: str = "SlowMockLLM"
     is_real_llm: bool = True
     details: str = "Mock für Nebenläufigkeits-Tests"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def __init__(self, reply: str = "### Bereich 1.4 – Emotionale und psychische Entwicklung\nAntwort"):
         self.reply = reply
@@ -62,6 +69,13 @@ class QuickMockLLM(LLMProvider):
     model_name: str = "QuickMockLLM"
     is_real_llm: bool = True
     details: str = "Schneller Mock"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def __init__(self, reply: str = "Antwort"):
         self.reply = reply

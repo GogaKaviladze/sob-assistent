@@ -564,6 +564,18 @@ def create_app(
             built.total_count,
         )
 
+        context_status_data = None
+        if (
+            bot.provider is not None
+            and hasattr(bot.provider, "count_tokens")
+            and callable(getattr(bot.provider, "count_tokens"))
+        ):
+            try:
+                _, cs = bot.fit_context_for_prompt(user_message="", bereich_id=req.bereich_id)
+                context_status_data = cs.to_dict()
+            except Exception:
+                pass
+
         return {
             "success": True,
             "bereich_id": req.bereich_id,
@@ -572,6 +584,7 @@ def create_app(
             "unassigned_count": built.unassigned_count,
             "total_count": built.total_count,
             "confirmed": bot.case.is_area_confirmed(req.bereich_id),
+            "context_status": context_status_data,
         }
 
     @app.post("/api/area/confirm")
@@ -617,7 +630,10 @@ def create_app(
                     yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
                     return
                 yield f"data: {json.dumps({'token': item}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'done': True, 'model': bot.model_info}, ensure_ascii=False)}\n\n"
+            done_payload: Dict[str, Any] = {"done": True, "model": bot.model_info}
+            if getattr(bot, "last_context_status", None):
+                done_payload["context_status"] = bot.last_context_status.to_dict()
+            yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(
             event_generator(),
@@ -906,6 +922,22 @@ def create_app(
         ]
         template_name = "op-de-wisch" if is_odw else "hamburg"
 
+        context_status_data = None
+        if (
+            bot.selected_bereich_id
+            and bot.provider is not None
+            and hasattr(bot.provider, "count_tokens")
+            and callable(getattr(bot.provider, "count_tokens"))
+        ):
+            try:
+                _, cs = bot.fit_context_for_prompt(user_message="", bereich_id=bot.selected_bereich_id)
+                context_status_data = cs.to_dict()
+            except Exception:
+                if getattr(bot, "last_context_status", None):
+                    context_status_data = bot.last_context_status.to_dict()
+        elif getattr(bot, "last_context_status", None):
+            context_status_data = bot.last_context_status.to_dict()
+
         return {
             "fall_id": bot.case.fall_id,
             "case_closed_reason": closed_reason,
@@ -923,6 +955,7 @@ def create_app(
             "template": template_name,
             "selected_area": selected_area_info,
             "available_areas": available_areas,
+            "context_status": context_status_data,
             "messages": bot.get_history(),
         }
 

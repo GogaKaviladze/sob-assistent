@@ -777,6 +777,34 @@
       pointer-events: none;
     }
 
+    .budget-status-strip {
+      padding: 6px 24px;
+      background: #0b1120;
+      border-top: 1px solid var(--card-border);
+      font-size: 0.78rem;
+      color: #94a3b8;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .budget-warning-container {
+      padding: 6px 24px;
+      background: rgba(245, 158, 11, 0.08);
+      border-top: 1px solid rgba(245, 158, 11, 0.25);
+      font-size: 0.78rem;
+      color: #fbbf24;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .budget-warning-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
     .input-bar {
       padding: 16px 24px;
       background: #131d31;
@@ -1159,6 +1187,12 @@
         >👤 Klientenperspektive einnehmen</button>
       </div>
 
+      <!-- Status-Streifen und ⚠️-Hinweise über dem Eingabefeld (Issue #17) -->
+      <div id="budgetWarningContainer" class="budget-warning-container" style="display: none;"></div>
+      <div id="budgetStatusStrip" class="budget-status-strip" style="display: none;">
+        <span id="budgetStatusText"></span>
+      </div>
+
       <!-- Eingabezeile -->
       <div class="input-bar">
         <textarea
@@ -1333,6 +1367,7 @@
         if (planCard && planCard.classList.contains('visible')) {
           planCardMeta.textContent = `${currentPlanGoalsCount} Bereiche erkannt`;
         }
+        updateBudgetUI(null);
         updateChatLockState();
         renderFilteredMessages();
         return;
@@ -1377,6 +1412,9 @@
         updateChatLockState();
         renderFilteredMessages();
         appendSystemNotification(`🎯 Arbeitsbereich: ${data.bereich_id} (${data.title})`);
+        if (data.context_status) {
+          updateBudgetUI(data.context_status);
+        }
       } catch (err) {
         showModalError("Verbindungsfehler", err.message);
       }
@@ -1417,6 +1455,56 @@
       } else {
         confirmAreaBtn.textContent = 'Bereich prüfen';
         confirmAreaBtn.classList.remove('btn-area-confirmed');
+      }
+    }
+
+    function updateBudgetUI(status) {
+      const strip = document.getElementById('budgetStatusStrip');
+      const textSpan = document.getElementById('budgetStatusText');
+      const warningBox = document.getElementById('budgetWarningContainer');
+      if (!strip || !textSpan || !warningBox) return;
+
+      if (!status || !status.bereich_id) {
+        strip.style.display = 'none';
+        warningBox.style.display = 'none';
+        return;
+      }
+
+      // Status-Streifen: "Bereich 3 · Vorbericht vollständig · Doku 7+12 Einträge · Kontext 6.210/16.384"
+      const vbStatus = status.vorbericht_complete ? "Vorbericht vollständig" : "Vorbericht gekürzt";
+      const assigned = Math.max(0, (status.entries_kept || 0) - (status.unassigned_kept || 0));
+      const unassigned = status.unassigned_kept || 0;
+      const dokuPart = `Doku ${assigned}+${unassigned} Einträge`;
+      const tokensPart = `Kontext ${(status.tokens_used || 0).toLocaleString('de-DE')}/${(status.n_ctx || 16384).toLocaleString('de-DE')}`;
+
+      textSpan.textContent = `Bereich ${status.bereich_id} · ${vbStatus} · ${dokuPart} · ${tokensPart}`;
+      strip.style.display = 'flex';
+
+      // ⚠️ notices (not in messages, not in export)
+      const notices = [];
+      if (!status.vorbericht_complete && status.sentences_total > 0) {
+        notices.push(`Bericht Bereich ${status.bereich_id} gekürzt: ${status.sentences_kept} von ${status.sentences_total} Sätzen im Kontext`);
+      }
+      if (status.entries_kept < status.entries_total) {
+        const dateInfo = status.oldest_included_date ? ` (ältere bis ${status.oldest_included_date} nicht)` : '';
+        notices.push(`Verlaufsdoku Bereich ${status.bereich_id}: ${status.entries_kept} von ${status.entries_total} Einträgen im Kontext${dateInfo}`);
+      }
+      if (status.dropped_messages > 0) {
+        notices.push(`${status.dropped_messages} ältere Nachrichten nicht mehr im Modellkontext (bleiben im Export)`);
+      }
+
+      if (notices.length > 0) {
+        warningBox.innerHTML = '';
+        notices.forEach(n => {
+          const item = document.createElement('div');
+          item.className = 'budget-warning-item';
+          item.textContent = `⚠️ ${n}`;
+          warningBox.appendChild(item);
+        });
+        warningBox.style.display = 'flex';
+      } else {
+        warningBox.style.display = 'none';
+        warningBox.innerHTML = '';
       }
     }
 
@@ -2106,6 +2194,7 @@
                   streamingMessage.append(data.token);
                 } else if (data.done) {
                   if (data.model) updateModelUI(data.model);
+                  if (data.context_status) updateBudgetUI(data.context_status);
                 }
               } catch (e) {
                 console.error("JSON Parse Error:", e, jsonStr);
@@ -2644,6 +2733,10 @@
           renderFilteredMessages();
         } else {
           allSessionMessages = [];
+        }
+
+        if (data.context_status) {
+          updateBudgetUI(data.context_status);
         }
       } catch (e) {
         console.error("Fehler beim Abrufen der Session:", e);

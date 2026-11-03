@@ -536,6 +536,65 @@
       position: relative;
     }
 
+    /* Arbeitsbereich Bar (Kontext 6 / Issue #136) */
+    .area-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 20px;
+      background: #0f172a;
+      border-bottom: 1px solid var(--card-border);
+      flex-wrap: wrap;
+      gap: 12px;
+      z-index: 5;
+    }
+
+    .area-select {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #f1f5f9;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      outline: none;
+      cursor: pointer;
+      min-width: 260px;
+      max-width: 440px;
+    }
+
+    .area-select:focus {
+      border-color: var(--primary);
+    }
+
+    .area-doku-badge {
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.35);
+      color: #93c5fd;
+      padding: 4px 9px;
+      border-radius: 5px;
+      font-size: 0.78rem;
+      font-weight: 500;
+    }
+
+    .ki-entwurf-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      font-size: 0.65rem;
+      font-weight: 600;
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.15);
+      border: 1px solid #f59e0b;
+      border-radius: 4px;
+      margin-left: 8px;
+      vertical-align: middle;
+    }
+
+    .btn-area-confirmed {
+      background: rgba(16, 185, 129, 0.2) !important;
+      border-color: #10b981 !important;
+      color: #34d399 !important;
+    }
+
     .messages-container {
       flex: 1;
       overflow-y: auto;
@@ -593,6 +652,14 @@
       background-color: var(--assistant-bg);
       color: #f1f5f9;
       border: 1px solid var(--card-border);
+      border-bottom-left-radius: 2px;
+    }
+
+    .message.error {
+      align-self: flex-start;
+      background-color: rgba(239, 68, 68, 0.12);
+      border: 1px solid #ef4444;
+      color: #fca5a5;
       border-bottom-left-radius: 2px;
     }
 
@@ -908,7 +975,7 @@
         <option value="">Modelle werden geladen...</option>
       </select>
       <button class="btn btn-outline" onclick="copyChatHistory()" title="Vollständigen Chatverlauf in die Zwischenablage kopieren">📋 Verlauf kopieren</button>
-      <select id="exportTemplateSelect" class="model-select" style="padding: 6px 10px; font-size: 0.85rem;" title="Vorlage für Word-Export wählen">
+      <select id="exportTemplateSelect" class="model-select" onchange="handleTemplateChange(this.value)" style="padding: 6px 10px; font-size: 0.85rem;" title="Vorlage für Word-Export wählen">
         <option value="hamburg">Hamburg — Fachamt</option>
         <option value="op-de-wisch">Op de Wisch</option>
       </select>
@@ -1030,6 +1097,32 @@
 
     <!-- Chat-Bereich -->
     <section class="chat-section">
+      <!-- Arbeitsbereich-Bar (Kontext 6 / Issue #136) -->
+      <div class="area-bar" id="areaBar">
+        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+          <label for="areaSelect" style="font-weight: 600; font-size: 0.85rem; color: #94a3b8; display: flex; align-items: center; gap: 5px;">
+            <span>🎯</span> Arbeitsbereich:
+          </label>
+          <select id="areaSelect" class="area-select" onchange="handleAreaChange(this.value)" title="Lebensbereich wählen">
+            <option value="">-- Lebensbereich wählen --</option>
+          </select>
+          <div id="areaCounters" style="display: none; align-items: center; gap: 8px; font-size: 0.8rem;">
+            <span id="areaDokuCount" class="area-doku-badge">Doku 0 Einträge</span>
+            <span id="areaUnassignedNotice" style="color: #94a3b8;"></span>
+          </div>
+        </div>
+        <button
+          type="button"
+          class="btn btn-outline"
+          id="confirmAreaBtn"
+          onclick="confirmCurrentArea()"
+          style="display: none; padding: 4px 12px; font-size: 0.8rem;"
+          title="Bestätigt den Lebensbereich als fachlich geprüft (Legal 1)"
+        >
+          Bereich prüfen
+        </button>
+      </div>
+
       <div class="messages-container" id="messagesContainer" tabindex="0">
         <div class="empty-state" id="emptyState">
           <h2>Interaktiver Reflexions-Dialog</h2>
@@ -1184,9 +1277,177 @@
     const toast = document.getElementById('toast');
     const diagModal = document.getElementById('diagModal');
 
+    const areaBar = document.getElementById('areaBar');
+    const areaSelect = document.getElementById('areaSelect');
+    const areaCounters = document.getElementById('areaCounters');
+    const areaDokuCount = document.getElementById('areaDokuCount');
+    const areaUnassignedNotice = document.getElementById('areaUnassignedNotice');
+    const confirmAreaBtn = document.getElementById('confirmAreaBtn');
+
     let isGenerating = false;
     let toastTimeout = null;
     let currentModelInfo = null;
+    let currentSelectedAreaId = null;
+    let currentPlanGoalsCount = 0;
+    let hasCsvLoaded = false;
+    let hasPlanLoaded = false;
+    let allSessionMessages = [];
+
+    function updateChatLockState() {
+      const isLocked = (hasCsvLoaded || hasPlanLoaded) && !currentSelectedAreaId;
+      if (isLocked) {
+        messageInput.disabled = true;
+        messageInput.placeholder = "Bitte zuerst einen Lebensbereich wählen";
+        sendBtn.disabled = true;
+        setChipsDisabled(true);
+      } else {
+        messageInput.disabled = isGenerating;
+        messageInput.placeholder = "Beobachtung schildern, Gedanken teilen oder Frage stellen… (Enter zum Senden)";
+        sendBtn.disabled = isGenerating;
+        setChipsDisabled(isGenerating);
+      }
+    }
+
+    function populateAreaSelect(areas, selectedId) {
+      if (!areaSelect) return;
+      const prevVal = selectedId || currentSelectedAreaId || "";
+      areaSelect.innerHTML = '<option value="">-- Lebensbereich wählen --</option>';
+      if (!areas || areas.length === 0) return;
+
+      areas.forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = a.id;
+        opt.textContent = `${a.id} ${a.title}${a.confirmed ? ' (geprüft ✓)' : ''}`;
+        if (a.id === prevVal) {
+          opt.selected = true;
+        }
+        areaSelect.appendChild(opt);
+      });
+    }
+
+    async function handleAreaChange(areaId) {
+      if (!areaId) {
+        currentSelectedAreaId = null;
+        if (areaCounters) areaCounters.style.display = 'none';
+        if (confirmAreaBtn) confirmAreaBtn.style.display = 'none';
+        if (planCard && planCard.classList.contains('visible')) {
+          planCardMeta.textContent = `${currentPlanGoalsCount} Bereiche erkannt`;
+        }
+        updateChatLockState();
+        renderFilteredMessages();
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/area', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bereich_id: areaId })
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          showModalError("Fehler bei Bereichsauswahl", errData.detail || "Bereich konnte nicht gewählt werden.");
+          return;
+        }
+        const data = await res.json();
+        currentSelectedAreaId = data.bereich_id;
+
+        // Zähler aktualisieren: „Doku 17+4 Einträge“ und „ℹ️ + 12 Einträge ohne Zuordnung einbezogen“
+        if (areaCounters) {
+          areaCounters.style.display = 'flex';
+          areaDokuCount.textContent = `Doku ${data.assigned_count}+${data.unassigned_count} Einträge`;
+          if (data.unassigned_count > 0) {
+            areaUnassignedNotice.textContent = `ℹ️ + ${data.unassigned_count} Einträge ohne Zuordnung einbezogen`;
+          } else {
+            areaUnassignedNotice.textContent = '';
+          }
+        }
+
+        // Bestätigen-Button anzeigen & aktualisieren
+        if (confirmAreaBtn) {
+          confirmAreaBtn.style.display = 'inline-flex';
+          updateConfirmButtonState(data.confirmed);
+        }
+
+        // Plan-Card Meta aktualisieren: „9 Bereiche erkannt · im Kontext: Bereich 1.4“
+        if (planCard && planCard.classList.contains('visible')) {
+          planCardMeta.textContent = `${currentPlanGoalsCount} Bereiche erkannt · im Kontext: Bereich ${data.bereich_id}`;
+        }
+
+        updateChatLockState();
+        renderFilteredMessages();
+        appendSystemNotification(`🎯 Arbeitsbereich: ${data.bereich_id} (${data.title})`);
+      } catch (err) {
+        showModalError("Verbindungsfehler", err.message);
+      }
+    }
+
+    async function confirmCurrentArea() {
+      if (!currentSelectedAreaId) return;
+      try {
+        const res = await fetch('/api/area/confirm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bereich_id: currentSelectedAreaId })
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          showModalError("Fehler beim Bestätigen", errData.detail || "Bestätigung fehlgeschlagen.");
+          return;
+        }
+        const data = await res.json();
+        updateConfirmButtonState(true);
+        showToast(`✓ Bereich ${currentSelectedAreaId} geprüft`);
+        if (areaSelect) {
+          const opt = areaSelect.querySelector(`option[value="${currentSelectedAreaId}"]`);
+          if (opt && !opt.textContent.includes('geprüft')) {
+            opt.textContent += ' (geprüft ✓)';
+          }
+        }
+      } catch (err) {
+        showModalError("Fehler beim Bestätigen", err.message);
+      }
+    }
+
+    function updateConfirmButtonState(isConfirmed) {
+      if (!confirmAreaBtn) return;
+      if (isConfirmed) {
+        confirmAreaBtn.textContent = '✓ Bereich geprüft';
+        confirmAreaBtn.classList.add('btn-area-confirmed');
+      } else {
+        confirmAreaBtn.textContent = 'Bereich prüfen';
+        confirmAreaBtn.classList.remove('btn-area-confirmed');
+      }
+    }
+
+    function renderFilteredMessages() {
+      messagesContainer.innerHTML = '';
+      chatScroll.resume();
+
+      const msgsToRender = currentSelectedAreaId
+        ? allSessionMessages.filter(m => !m.bereich_id || m.bereich_id === currentSelectedAreaId)
+        : allSessionMessages;
+
+      if (msgsToRender.length === 0) {
+        if (emptyState) {
+          messagesContainer.appendChild(emptyState);
+          emptyState.style.display = 'block';
+        }
+        return;
+      }
+
+      if (emptyState) emptyState.style.display = 'none';
+      msgsToRender.forEach(m => {
+        if (m.role === 'user') {
+          appendUserMessage(m.content);
+        } else if (m.role === 'error') {
+          appendErrorMessage(m.content);
+        } else {
+          const bubble = createAssistantMessageBubble();
+          bubble.contentDiv.innerHTML = formatMarkdown(m.content);
+        }
+      });
+    }
 
     function getInitialPresentationMode() {
       const params = new URLSearchParams(window.location.search);
@@ -1305,7 +1566,7 @@
       if (modal && titleEl && msgEl) {
         titleEl.textContent = title;
         msgEl.textContent = message;
-        modal.classList.add('open');
+        modal.classList.add('active');
       } else {
         alert(title + ": " + message);
       }
@@ -1405,6 +1666,8 @@
       }
 
       csvCard.classList.add('visible');
+      hasCsvLoaded = true;
+      updateChatLockState();
     }
 
     function toggleCsvDetails() {
@@ -1424,6 +1687,8 @@
         csvToggleDetailsBtn.textContent = 'Details anzeigen';
         csvToggleDetailsBtn.setAttribute('aria-expanded', 'false');
       }
+      hasCsvLoaded = false;
+      updateChatLockState();
     }
 
     async function removeCsv() {
@@ -1453,6 +1718,9 @@
       if (planDot) planDot.style.display = 'none';
       planCard.classList.remove('visible');
       if (planFileInput) planFileInput.value = "";
+      hasPlanLoaded = false;
+      currentPlanGoalsCount = 0;
+      updateChatLockState();
     }
 
     async function handlePlanFileSelected(files, newCase = false) {
@@ -1492,6 +1760,18 @@
             ? `${data.zeitraum_von || ''} bis ${data.zeitraum_bis || ''}`.trim()
             : (data.zeitraum || '');
           updatePlanUI(data.filename, data.goals_count, data.client_name, data.preview, period, data.hidden_removed);
+          if (data.template) {
+            const templateSelect = document.getElementById('exportTemplateSelect');
+            if (templateSelect) {
+              templateSelect.value = data.template;
+            }
+          }
+          if (data.available_areas) {
+            currentSelectedAreaId = null;
+            populateAreaSelect(data.available_areas, null);
+            if (areaCounters) areaCounters.style.display = 'none';
+            updateConfirmButtonState(false);
+          }
           appendSystemNotification(
             `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
           );
@@ -1519,7 +1799,12 @@
 
       planCardFilename.textContent = filename;
       planCardFilename.title = filename;
-      planCardMeta.textContent = `${goalsCount} Bereiche erkannt`;
+      hasPlanLoaded = true;
+      currentPlanGoalsCount = goalsCount || 0;
+      planCardMeta.textContent = currentSelectedAreaId
+        ? `${goalsCount} Bereiche erkannt · im Kontext: Bereich ${currentSelectedAreaId}`
+        : `${goalsCount} Bereiche erkannt`;
+      updateChatLockState();
 
       const hiddenElem = document.getElementById('planHiddenWarning');
       if (hiddenElem) {
@@ -1608,7 +1893,7 @@
 
       const header = document.createElement('div');
       header.className = 'message-header';
-      header.innerHTML = `<span>Reflexions-Begleiter</span> <span style="font-size: 0.7rem; color: #34d399;">${escapeHtml(badgeText)}</span>`;
+      header.innerHTML = `<span>Reflexions-Begleiter</span> <span style="font-size: 0.7rem; color: #34d399;">${escapeHtml(badgeText)}</span> <span class="ki-entwurf-badge">KI-Entwurf</span>`;
       msgDiv.appendChild(header);
 
       const contentDiv = document.createElement('div');
@@ -1624,6 +1909,28 @@
 
       messagesContainer.appendChild(msgDiv);
       return { msgDiv, contentDiv };
+    }
+
+    function appendErrorMessage(text) {
+      if (emptyState) emptyState.style.display = 'none';
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'message error';
+
+      const header = document.createElement('div');
+      header.className = 'message-header';
+      header.style.color = '#ef4444';
+      header.innerHTML = '<span>System-Hinweis</span>';
+      msgDiv.appendChild(header);
+
+      const contentNode = document.createElement('div');
+      contentNode.className = 'content';
+      contentNode.style.color = '#fca5a5';
+      contentNode.textContent = text;
+      msgDiv.appendChild(contentNode);
+
+      messagesContainer.appendChild(msgDiv);
+      chatScroll.follow();
+      return msgDiv;
     }
 
     function createChatScroll(container) {
@@ -1707,6 +2014,9 @@
           textNode.appendData(token);
           chatScroll.follow();
         },
+        getText() {
+          return textNode.data;
+        },
         finish() {
           if (started) contentDiv.innerHTML = formatMarkdown(textNode.data);
           else contentDiv.textContent = 'Keine Antwort erhalten.';
@@ -1729,6 +2039,7 @@
       const text = messageInput.value.trim();
       if (!text) return;
 
+      allSessionMessages.push({ role: 'user', content: text, bereich_id: currentSelectedAreaId });
       appendUserMessage(text);
       messageInput.value = '';
       isGenerating = true;
@@ -1746,13 +2057,22 @@
         });
 
         if (!response.ok) {
-          if (response.status === 503) {
-            const errData = await response.json().catch(() => ({}));
-            contentDiv.closest('.message')?.remove();
-            showModalError("Kein Modell geladen", errData.detail || "Kein Modell geladen.");
-            return;
+          const errData = await response.json().catch(() => ({}));
+          contentDiv.closest('.message')?.remove();
+          let detail = errData.detail;
+          if (Array.isArray(detail)) {
+            detail = detail.map(d => (d && d.msg) ? d.msg : JSON.stringify(d)).join("; ");
+          } else if (typeof detail === 'object' && detail !== null) {
+            detail = detail.msg || detail.message || JSON.stringify(detail);
           }
-          throw new Error("HTTP Fehler " + response.status);
+          const fallbackMsg = response.status === 503 ? "Kein Modell geladen." : `HTTP Fehler ${response.status}`;
+          let errorText = detail || fallbackMsg;
+          if (!errorText.startsWith('❌')) {
+            errorText = `❌ ${errorText}`;
+          }
+          appendErrorMessage(errorText);
+          allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
+          return;
         }
 
         const reader = response.body.getReader();
@@ -1774,7 +2094,12 @@
                 const data = JSON.parse(jsonStr);
                 if (data.error) {
                   contentDiv.closest('.message')?.remove();
-                  showModalError("Fehler bei der Modell-Generierung", data.error);
+                  let errStr = String(data.error);
+                  if (!errStr.startsWith('❌')) {
+                    errStr = `❌ ${errStr}`;
+                  }
+                  appendErrorMessage(errStr);
+                  allSessionMessages.push({ role: 'error', content: errStr, bereich_id: currentSelectedAreaId });
                   return;
                 }
                 if (data.token) {
@@ -1790,10 +2115,13 @@
         }
 
         streamingMessage.finish();
+        allSessionMessages.push({ role: 'assistant', content: streamingMessage.getText(), bereich_id: currentSelectedAreaId });
 
       } catch (err) {
         contentDiv.closest('.message')?.remove();
-        showModalError("Kommunikationsfehler", err.message);
+        const errorText = `❌ Kommunikationsfehler: ${err.message}`;
+        appendErrorMessage(errorText);
+        allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
       } finally {
         isGenerating = false;
         chatScroll.follow();
@@ -1833,6 +2161,7 @@
       if (isGenerating) return;
       if (confirm("Möchten Sie den Chatverlauf wirklich leeren?")) {
         await fetch('/api/reset-chat', { method: 'POST' });
+        allSessionMessages = [];
         messagesContainer.innerHTML = '';
         chatScroll.resume();
         if (emptyState) {
@@ -1850,6 +2179,16 @@
       if (isGenerating) return;
       if (confirm("Möchten Sie einen neuen Fall beginnen und alle Daten (Chat, CSV und Vorbericht) vollständig zurücksetzen?")) {
         await fetch('/api/reset', { method: 'POST' });
+
+        allSessionMessages = [];
+        currentSelectedAreaId = null;
+        hasCsvLoaded = false;
+        hasPlanLoaded = false;
+        currentPlanGoalsCount = 0;
+        if (areaSelect) areaSelect.value = '';
+        if (areaCounters) areaCounters.style.display = 'none';
+        if (confirmAreaBtn) confirmAreaBtn.style.display = 'none';
+        updateChatLockState();
 
         // CSV UI zurücksetzen
         csvLabel.textContent = "Keine CSV geladen";
@@ -2076,6 +2415,27 @@
       }
     }
 
+    async function handleTemplateChange(templateVal) {
+      if (!templateVal) return;
+      try {
+        const res = await fetch(`/api/areas?template=${encodeURIComponent(templateVal)}`);
+        if (res.ok) {
+          const data = await res.json();
+          const areas = data.available_areas || data.areas;
+          currentSelectedAreaId = null;
+          populateAreaSelect(areas, null);
+          if (areaCounters) areaCounters.style.display = 'none';
+          updateConfirmButtonState(false);
+          updateChatLockState();
+          showToast(`Vorlage gewechselt: ${templateVal === 'op-de-wisch' ? 'Op de Wisch' : 'Hamburg'}`);
+        } else {
+          showModalError("Fehler beim Vorlagenwechsel", `HTTP ${res.status}`);
+        }
+      } catch (err) {
+        showModalError("Fehler beim Vorlagenwechsel", err.message);
+      }
+    }
+
     async function handleModelChange(modelName) {
       if (!modelName) return;
       if (isGenerating) {
@@ -2245,16 +2605,45 @@
           const period = (data.plan.zeitraum_von || data.plan.zeitraum_bis) ? `${data.plan.zeitraum_von} bis ${data.plan.zeitraum_bis}` : "";
           updatePlanUI(data.plan.filename, data.plan.goals_count, data.plan.client_name, data.plan.preview, period);
         }
-        if (data.messages && data.messages.length > 0) {
-          if (emptyState) emptyState.style.display = 'none';
-          data.messages.forEach(m => {
-            if (m.role === 'user') {
-              appendUserMessage(m.content);
+        if (data.template) {
+          const templateSelect = document.getElementById('exportTemplateSelect');
+          if (templateSelect) {
+            templateSelect.value = data.template;
+          }
+        }
+        if (data.available_areas) {
+          populateAreaSelect(data.available_areas, data.selected_area ? data.selected_area.id : null);
+        }
+
+        if (data.selected_area) {
+          currentSelectedAreaId = data.selected_area.id;
+          if (areaCounters) {
+            areaCounters.style.display = 'flex';
+            areaDokuCount.textContent = `Doku ${data.selected_area.assigned_count}+${data.selected_area.unassigned_count} Einträge`;
+            if (data.selected_area.unassigned_count > 0) {
+              areaUnassignedNotice.textContent = `ℹ️ + ${data.selected_area.unassigned_count} Einträge ohne Zuordnung einbezogen`;
             } else {
-              const bubble = createAssistantMessageBubble();
-              bubble.contentDiv.innerHTML = formatMarkdown(m.content);
+              areaUnassignedNotice.textContent = '';
             }
-          });
+          }
+          if (confirmAreaBtn) {
+            confirmAreaBtn.style.display = 'inline-flex';
+            updateConfirmButtonState(data.selected_area.confirmed);
+          }
+          if (planCard && planCard.classList.contains('visible')) {
+            planCardMeta.textContent = `${currentPlanGoalsCount} Bereiche erkannt · im Kontext: Bereich ${data.selected_area.id}`;
+          }
+        }
+
+        hasCsvLoaded = Boolean(data.has_csv);
+        hasPlanLoaded = Boolean(data.has_plan);
+        updateChatLockState();
+
+        if (data.messages && data.messages.length > 0) {
+          allSessionMessages = data.messages.map(m => ({ ...m }));
+          renderFilteredMessages();
+        } else {
+          allSessionMessages = [];
         }
       } catch (e) {
         console.error("Fehler beim Abrufen der Session:", e);

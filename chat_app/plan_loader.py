@@ -16,6 +16,7 @@ from typing import Any, BinaryIO, Dict, List, Optional, Union
 from sob_generator import docx_fields as fields
 from sob_generator.docx_safety import SafeDocx, sanitize_docx_bytes
 from sob_generator.llm.sections import SECTION_DEFINITIONS
+from sob_generator.llm.sections_op_de_wisch import OP_DE_WISCH_SECTION_DEFINITIONS
 from sob_generator.previous_sob import IncompletePlanError
 
 from .logger import logger
@@ -88,6 +89,7 @@ class PlanData:
     client_name_from_filename: bool = False
     is_fallback: bool = False
     hidden_removed: int = 0
+    template: str = ""
 
     @property
     def goals_count(self) -> int:
@@ -149,7 +151,7 @@ class PlanData:
 
     def to_context_text(self) -> str:
         """Formatiert den Gesamtplan für den Kontext des LLM-Systemprompts."""
-        lines = [f"Bisheriger Gesamtplan / Vorbericht (Datei: {self.filename}):"]
+        lines = ["Bisheriger Gesamtplan / Vorbericht:"]
         if self.client_name:
             lines.append(f"Klient:in: {self.client_name}")
         if self.zeitraum_von or self.zeitraum_bis:
@@ -241,7 +243,14 @@ def parse_plan_docx(
                 mapped_goals: List[PlanGoalItem] = []
                 sections_dict = getattr(plan_result, "sections", {})
                 items = list(sections_dict.values()) if isinstance(sections_dict, dict) else list(sections_dict)
-                section_title_map = {d.id: d.title for d in SECTION_DEFINITIONS}
+                is_odw = bool(
+                    any(getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"} for g in items)
+                    or "op_de_wisch" in filename.lower()
+                    or "op-de-wisch" in filename.lower()
+                    or "fo_svb" in filename.lower()
+                )
+                defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+                section_title_map = {d.id: d.title for d in defs}
                 any_section_content = any(
                     bool(
                         getattr(g, "leitziel", "")
@@ -313,11 +322,19 @@ def parse_plan_docx(
                         goals=mapped_goals,
                         raw_summary=raw_summary,
                         hidden_removed=hidden_removed,
+                        template="op-de-wisch" if is_odw else "hamburg",
                     )
             elif hasattr(plan_result, "goals"):
                 # Mapping falls anderes Dataclass-Objekt
                 mapped_goals = []
-                for g in getattr(plan_result, "goals", []):
+                goal_list = getattr(plan_result, "goals", [])
+                is_odw = bool(
+                    any(getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"} for g in goal_list)
+                    or "op_de_wisch" in filename.lower()
+                    or "op-de-wisch" in filename.lower()
+                    or "fo_svb" in filename.lower()
+                )
+                for g in goal_list:
                     mapped_goals.append(
                         PlanGoalItem(
                             section_id=getattr(g, "section_id", ""),
@@ -341,6 +358,7 @@ def parse_plan_docx(
                     goals=mapped_goals,
                     raw_summary=getattr(plan_result, "raw_summary", "") or getattr(plan_result, "developments", ""),
                     hidden_removed=hidden_removed,
+                    template="op-de-wisch" if is_odw else "hamburg",
                 )
     except IncompletePlanError:
         raise
@@ -484,6 +502,12 @@ def parse_plan_docx(
         client_name = extract_client_name_from_filename(filename)
         client_name_from_filename = bool(client_name)
 
+    is_odw = bool(
+        "op_de_wisch" in filename.lower()
+        or "op-de-wisch" in filename.lower()
+        or "fo_svb" in filename.lower()
+    )
+
     return PlanData(
         filename=filename,
         client_name=client_name,
@@ -493,4 +517,5 @@ def parse_plan_docx(
         zeitraum_bis=zeitraum_bis,
         goals=extracted_goals,
         hidden_removed=hidden_removed,
+        template="op-de-wisch" if is_odw else "hamburg",
     )

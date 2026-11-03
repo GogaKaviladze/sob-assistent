@@ -113,9 +113,10 @@ def test_upload_confirmation_409_and_new_case_override():
     assert res_a.status_code == 200
 
     # Chattanfrage stellen
+    client.post("/api/area", json={"bereich_id": "1.1"})
     res_chat = client.post("/api/chat", json={"message": "Frage zu ZZ_SYNTH_FALL_A"})
     assert res_chat.status_code == 200
-    assert "ZZ_SYNTH_FALL_A" in bot._build_payload()[0]["content"]
+    assert any("ZZ_SYNTH_FALL_A" in m["content"] for m in bot._build_payload())
 
     # 2. Fall B hochladen ohne Bestätigung -> 409
     csv_b = "Datum;Kategorie;Text\n02.02.2025;Wohnen;ZZ_SYNTH_FALL_B_DATA"
@@ -141,7 +142,7 @@ def test_upload_confirmation_409_and_new_case_override():
     assert res_b_ok.status_code == 200
 
     # Marker A darf nirgendwo mehr vorhanden sein
-    assert "ZZ_SYNTH_FALL_A" not in bot._build_payload()[0]["content"]
+    assert not any("ZZ_SYNTH_FALL_A" in m["content"] for m in bot._build_payload())
     assert len(bot.messages) == 0
     export_text = bot.export_markdown()
     assert "ZZ_SYNTH_FALL_A" not in export_text

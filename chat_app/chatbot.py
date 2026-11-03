@@ -604,6 +604,17 @@ class ReflectionChatbot:
             self.case.selected_bereich_id = value
             self.touch()
 
+    @property
+    def template(self) -> str:
+        with self._lock:
+            return self.case.template
+
+    @template.setter
+    def template(self, value: str) -> None:
+        with self._lock:
+            self.case.template = value
+            self.touch()
+
     def touch(self) -> None:
         """Aktualisiert die letzte Fall-Aktivität."""
         with self._lock:
@@ -733,6 +744,10 @@ class ReflectionChatbot:
                     "zeitraum_von": plan.zeitraum_von,
                     "zeitraum_bis": plan.zeitraum_bis,
                 }
+                if plan.template:
+                    self.case.template = plan.template
+                elif any(getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"} for g in plan.goals):
+                    self.case.template = "op-de-wisch"
             elif hasattr(plan, "to_compact_context"):
                 self.case.plan = plan
                 self.case.plan_context = plan.to_compact_context()
@@ -740,6 +755,9 @@ class ReflectionChatbot:
                     "client_name": getattr(plan, "client_name", ""),
                     "zeitraum": getattr(plan, "zeitraum", ""),
                 }
+                sections_dict = getattr(plan, "sections", {})
+                if any(k in {"1", "2", "4", "5", "6", "7", "8", "9"} for k in sections_dict):
+                    self.case.template = "op-de-wisch"
             elif isinstance(plan, str):
                 self.case.plan_context = plan.strip() if plan else None
                 self.case.plan = None

@@ -1194,6 +1194,34 @@ def test_card_filename_wrapping_and_containment(client):
     assert "csvCardFilename.title = filename" in html
 
 
+def test_index_html_chat_stream_error_handling_shows_red_message(client):
+    """Prüft, dass bei Fehlern von /api/chat-stream (409/422/503) eine rote Chat-Meldung mit ❌ angezeigt wird (#149)."""
+    res = client.get("/")
+    assert res.status_code == 200
+    html = res.text
+
+    # 1. CSS-Regel für rote Fehlermeldungen im Chat
+    assert ".message.error" in html
+    error_css_idx = html.find(".message.error")
+    error_css_block = html[error_css_idx:html.find("}", error_css_idx)]
+    assert "#ef4444" in error_css_block
+
+    # 2. appendErrorMessage DOM-Funktion
+    assert "function appendErrorMessage(text)" in html
+
+    # 3. sendMessage: Chatfehler zeigt rote Fehlermeldung statt Modal
+    start_idx = html.find("async function sendMessage()")
+    assert start_idx != -1
+    end_idx = html.find("function setChipsDisabled", start_idx)
+    send_msg_block = html[start_idx:end_idx]
+
+    assert "showModalError" not in send_msg_block
+    assert "appendErrorMessage" in send_msg_block
+    assert "errData.detail" in send_msg_block
+    assert "allSessionMessages.push({ role: 'error'" in send_msg_block
+
+
+
 
 
 

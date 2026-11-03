@@ -655,6 +655,14 @@
       border-bottom-left-radius: 2px;
     }
 
+    .message.error {
+      align-self: flex-start;
+      background-color: rgba(239, 68, 68, 0.12);
+      border: 1px solid #ef4444;
+      color: #fca5a5;
+      border-bottom-left-radius: 2px;
+    }
+
     .message-header {
       display: flex;
       justify-content: space-between;
@@ -967,7 +975,7 @@
         <option value="">Modelle werden geladen...</option>
       </select>
       <button class="btn btn-outline" onclick="copyChatHistory()" title="Vollständigen Chatverlauf in die Zwischenablage kopieren">📋 Verlauf kopieren</button>
-      <select id="exportTemplateSelect" class="model-select" style="padding: 6px 10px; font-size: 0.85rem;" title="Vorlage für Word-Export wählen">
+      <select id="exportTemplateSelect" class="model-select" onchange="handleTemplateChange(this.value)" style="padding: 6px 10px; font-size: 0.85rem;" title="Vorlage für Word-Export wählen">
         <option value="hamburg">Hamburg — Fachamt</option>
         <option value="op-de-wisch">Op de Wisch</option>
       </select>
@@ -1432,6 +1440,8 @@
       msgsToRender.forEach(m => {
         if (m.role === 'user') {
           appendUserMessage(m.content);
+        } else if (m.role === 'error') {
+          appendErrorMessage(m.content);
         } else {
           const bubble = createAssistantMessageBubble();
           bubble.contentDiv.innerHTML = formatMarkdown(m.content);
@@ -1556,7 +1566,7 @@
       if (modal && titleEl && msgEl) {
         titleEl.textContent = title;
         msgEl.textContent = message;
-        modal.classList.add('open');
+        modal.classList.add('active');
       } else {
         alert(title + ": " + message);
       }
@@ -1750,6 +1760,18 @@
             ? `${data.zeitraum_von || ''} bis ${data.zeitraum_bis || ''}`.trim()
             : (data.zeitraum || '');
           updatePlanUI(data.filename, data.goals_count, data.client_name, data.preview, period, data.hidden_removed);
+          if (data.template) {
+            const templateSelect = document.getElementById('exportTemplateSelect');
+            if (templateSelect) {
+              templateSelect.value = data.template;
+            }
+          }
+          if (data.available_areas) {
+            currentSelectedAreaId = null;
+            populateAreaSelect(data.available_areas, null);
+            if (areaCounters) areaCounters.style.display = 'none';
+            updateConfirmButtonState(false);
+          }
           appendSystemNotification(
             `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
           );
@@ -1889,6 +1911,28 @@
       return { msgDiv, contentDiv };
     }
 
+    function appendErrorMessage(text) {
+      if (emptyState) emptyState.style.display = 'none';
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'message error';
+
+      const header = document.createElement('div');
+      header.className = 'message-header';
+      header.style.color = '#ef4444';
+      header.innerHTML = '<span>System-Hinweis</span>';
+      msgDiv.appendChild(header);
+
+      const contentNode = document.createElement('div');
+      contentNode.className = 'content';
+      contentNode.style.color = '#fca5a5';
+      contentNode.textContent = text;
+      msgDiv.appendChild(contentNode);
+
+      messagesContainer.appendChild(msgDiv);
+      chatScroll.follow();
+      return msgDiv;
+    }
+
     function createChatScroll(container) {
       let following = true;
       let frame = null;
@@ -2015,9 +2059,19 @@
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
           contentDiv.closest('.message')?.remove();
-          const title = response.status === 503 ? "Kein Modell geladen" : "Fehler bei Chat-Anfrage";
+          let detail = errData.detail;
+          if (Array.isArray(detail)) {
+            detail = detail.map(d => (d && d.msg) ? d.msg : JSON.stringify(d)).join("; ");
+          } else if (typeof detail === 'object' && detail !== null) {
+            detail = detail.msg || detail.message || JSON.stringify(detail);
+          }
           const fallbackMsg = response.status === 503 ? "Kein Modell geladen." : `HTTP Fehler ${response.status}`;
-          showModalError(title, errData.detail || fallbackMsg);
+          let errorText = detail || fallbackMsg;
+          if (!errorText.startsWith('❌')) {
+            errorText = `❌ ${errorText}`;
+          }
+          appendErrorMessage(errorText);
+          allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
           return;
         }
 
@@ -2040,7 +2094,12 @@
                 const data = JSON.parse(jsonStr);
                 if (data.error) {
                   contentDiv.closest('.message')?.remove();
-                  showModalError("Fehler bei der Modell-Generierung", data.error);
+                  let errStr = String(data.error);
+                  if (!errStr.startsWith('❌')) {
+                    errStr = `❌ ${errStr}`;
+                  }
+                  appendErrorMessage(errStr);
+                  allSessionMessages.push({ role: 'error', content: errStr, bereich_id: currentSelectedAreaId });
                   return;
                 }
                 if (data.token) {
@@ -2060,7 +2119,9 @@
 
       } catch (err) {
         contentDiv.closest('.message')?.remove();
-        showModalError("Kommunikationsfehler", err.message);
+        const errorText = `❌ Kommunikationsfehler: ${err.message}`;
+        appendErrorMessage(errorText);
+        allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
       } finally {
         isGenerating = false;
         chatScroll.follow();
@@ -2354,6 +2415,27 @@
       }
     }
 
+    async function handleTemplateChange(templateVal) {
+      if (!templateVal) return;
+      try {
+        const res = await fetch(`/api/areas?template=${encodeURIComponent(templateVal)}`);
+        if (res.ok) {
+          const data = await res.json();
+          const areas = data.available_areas || data.areas;
+          currentSelectedAreaId = null;
+          populateAreaSelect(areas, null);
+          if (areaCounters) areaCounters.style.display = 'none';
+          updateConfirmButtonState(false);
+          updateChatLockState();
+          showToast(`Vorlage gewechselt: ${templateVal === 'op-de-wisch' ? 'Op de Wisch' : 'Hamburg'}`);
+        } else {
+          showModalError("Fehler beim Vorlagenwechsel", `HTTP ${res.status}`);
+        }
+      } catch (err) {
+        showModalError("Fehler beim Vorlagenwechsel", err.message);
+      }
+    }
+
     async function handleModelChange(modelName) {
       if (!modelName) return;
       if (isGenerating) {
@@ -2522,6 +2604,12 @@
         if (data.has_plan && data.plan) {
           const period = (data.plan.zeitraum_von || data.plan.zeitraum_bis) ? `${data.plan.zeitraum_von} bis ${data.plan.zeitraum_bis}` : "";
           updatePlanUI(data.plan.filename, data.plan.goals_count, data.plan.client_name, data.plan.preview, period);
+        }
+        if (data.template) {
+          const templateSelect = document.getElementById('exportTemplateSelect');
+          if (templateSelect) {
+            templateSelect.value = data.template;
+          }
         }
         if (data.available_areas) {
           populateAreaSelect(data.available_areas, data.selected_area ? data.selected_area.id : null);

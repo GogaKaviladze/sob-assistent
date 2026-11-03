@@ -73,6 +73,10 @@ class SelectAreaRequest(BaseModel):
     bereich_id: ValidAreaId
 
 
+class SelectTemplateRequest(BaseModel):
+    template: str
+
+
 DEFAULT_DOCX_PARSE_TIMEOUT = 10.0
 
 _GENERIC_CLIENT_NAMES = {
@@ -355,8 +359,30 @@ def create_app(
             else:
                 bot.hard_reset(reason="reset")
 
+            is_odw = bool(
+                getattr(parsed_plan, "template", "") == "op-de-wisch"
+                or any(
+                    getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                    for g in getattr(parsed_plan, "goals", [])
+                )
+                or "op_de_wisch" in parsed_plan.filename.lower()
+                or "op-de-wisch" in parsed_plan.filename.lower()
+                or "fo_svb" in parsed_plan.filename.lower()
+            )
+            template_name = "op-de-wisch" if is_odw else "hamburg"
+            bot.case.template = template_name
             bot.set_plan(parsed_plan)
             log_plan_loaded(goals_count=parsed_plan.goals_count)
+
+            area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+            available_areas = [
+                {
+                    "id": s.id,
+                    "title": s.title,
+                    "confirmed": bot.case.is_area_confirmed(s.id),
+                }
+                for s in area_defs
+            ]
 
             plan_resp: Dict[str, Any] = {
                 "success": True,
@@ -368,6 +394,8 @@ def create_app(
                 "zeitraum_von": parsed_plan.zeitraum_von,
                 "zeitraum_bis": parsed_plan.zeitraum_bis,
                 "hidden_removed": getattr(parsed_plan, "hidden_removed", 0),
+                "template": template_name,
+                "available_areas": available_areas,
             }
             if warning:
                 plan_resp["warning"] = warning
@@ -399,6 +427,23 @@ def create_app(
             else:
                 bot.hard_reset(reason="reset")
 
+            is_odw = bool(
+                "op de wisch" in content_text.lower()
+                or "op-de-wisch" in file.filename.lower()
+                or "op_de_wisch" in file.filename.lower()
+            )
+            template_name = "op-de-wisch" if is_odw else "hamburg"
+            bot.case.template = template_name
+            area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+            available_areas = [
+                {
+                    "id": s.id,
+                    "title": s.title,
+                    "confirmed": bot.case.is_area_confirmed(s.id),
+                }
+                for s in area_defs
+            ]
+
             bot.set_plan_context(content_text, plan_info={"filename": file.filename})
             return {
                 "success": True,
@@ -409,21 +454,97 @@ def create_app(
                 "zeitraum_von": "",
                 "zeitraum_bis": "",
                 "preview": (bot.plan_context[:200] if bot.plan_context else ""),
+                "template": template_name,
+                "available_areas": available_areas,
             }
 
     def _validate_area_for_template(bereich_id: str) -> None:
         """Prüft bereich_id gegen die Bereiche der geladenen Vorlage."""
-        if not bot.plan_data:
-            return
-        is_odw = any(
-            getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-            for g in getattr(bot.plan_data, "goals", [])
+        is_odw = bool(
+            bot.case.template == "op-de-wisch"
+            or (
+                bot.plan_data
+                and (
+                    getattr(bot.plan_data, "template", "") == "op-de-wisch"
+                    or any(
+                        getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                        for g in getattr(bot.plan_data, "goals", [])
+                    )
+                )
+            )
         )
         valid_ids = {
             s.id for s in (OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS)
         }
         if bereich_id not in valid_ids:
             raise HTTPException(status_code=422, detail="❌ Bereich gehört nicht zur Vorlage")
+
+    @app.get("/api/areas")
+    async def get_areas(template: Optional[str] = None) -> Dict[str, Any]:
+        """Liefert die verfügbaren Lebensbereiche für die aktive oder angefragte Vorlage."""
+        bot.check_ttl()
+        if template:
+            norm = template.strip().lower()
+            is_odw = norm in {"op-de-wisch", "op_de_wisch", "hamburg_op_de_wisch", "odw"}
+            bot.case.template = "op-de-wisch" if is_odw else "hamburg"
+        else:
+            is_odw = bool(
+                bot.case.template == "op-de-wisch"
+                or (
+                    bot.plan_data
+                    and (
+                        getattr(bot.plan_data, "template", "") == "op-de-wisch"
+                        or any(
+                            getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                            for g in getattr(bot.plan_data, "goals", [])
+                        )
+                    )
+                )
+            )
+        area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+        available_areas = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "confirmed": bot.case.is_area_confirmed(s.id),
+            }
+            for s in area_defs
+        ]
+        return {
+            "success": True,
+            "template": "op-de-wisch" if is_odw else "hamburg",
+            "available_areas": available_areas,
+            "areas": available_areas,
+        }
+
+    @app.post("/api/template")
+    async def select_template(req: SelectTemplateRequest) -> Dict[str, Any]:
+        """Wechselt die aktive Berichtsvorlage (hamburg oder op-de-wisch)."""
+        bot.check_ttl()
+        norm = req.template.strip().lower()
+        is_odw = norm in {"op-de-wisch", "op_de_wisch", "hamburg_op_de_wisch", "odw"}
+        template_key = "op-de-wisch" if is_odw else "hamburg"
+        bot.case.template = template_key
+
+        area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+        valid_ids = {s.id for s in area_defs}
+        if bot.selected_bereich_id and bot.selected_bereich_id not in valid_ids:
+            bot.selected_bereich_id = None
+
+        available_areas = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "confirmed": bot.case.is_area_confirmed(s.id),
+            }
+            for s in area_defs
+        ]
+        return {
+            "success": True,
+            "template": template_key,
+            "available_areas": available_areas,
+            "areas": available_areas,
+        }
 
     @app.post("/api/area")
     async def select_area(req: SelectAreaRequest) -> Dict[str, Any]:
@@ -470,14 +591,17 @@ def create_app(
     async def chat_stream(req: ChatMessageRequest):
         """Streamt die Modellantwort Token für Token via Server-Sent Events (SSE)."""
         bot.check_ttl()
-        if bot.has_plan and (
-            not bot.selected_bereich_id
-            or not bot.case.is_area_confirmed(bot.selected_bereich_id)
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="❌ Bitte zuerst einen Lebensbereich wählen",
-            )
+        if bot.has_plan:
+            if not bot.selected_bereich_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="❌ Bitte zuerst einen Lebensbereich wählen",
+                )
+            if not bot.case.is_area_confirmed(bot.selected_bereich_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="❌ Bitte den Bereich mit „Bereich prüfen“ bestätigen",
+                )
 
         if bot.provider is None:
             reason = bot.model_error or "Modelldatei fehlt"
@@ -759,10 +883,16 @@ def create_app(
             }
 
         is_odw = bool(
-            bot.plan_data
-            and any(
-                getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                for g in getattr(bot.plan_data, "goals", [])
+            bot.case.template == "op-de-wisch"
+            or (
+                bot.plan_data
+                and (
+                    getattr(bot.plan_data, "template", "") == "op-de-wisch"
+                    or any(
+                        getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                        for g in getattr(bot.plan_data, "goals", [])
+                    )
+                )
             )
         )
         area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
@@ -774,6 +904,7 @@ def create_app(
             }
             for s in area_defs
         ]
+        template_name = "op-de-wisch" if is_odw else "hamburg"
 
         return {
             "fall_id": bot.case.fall_id,
@@ -789,6 +920,7 @@ def create_app(
             "csv": csv_info,
             "plan": plan_info,
             "model": bot.model_info,
+            "template": template_name,
             "selected_area": selected_area_info,
             "available_areas": available_areas,
             "messages": bot.get_history(),

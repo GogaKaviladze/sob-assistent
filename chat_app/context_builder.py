@@ -108,11 +108,17 @@ class ContextBuilder:
     def build(cls, case: Any, bereich_id: str) -> BuiltContext:
         """Erzeugt BuiltContext für den angegebenen Bereich."""
         is_odw = bool(
-            case.plan
-            and any(
-                getattr(g, "section_id", "") in ODW_TITLES
-                and getattr(g, "section_id", "") not in HAMBURG_TITLES
-                for g in getattr(case.plan, "goals", [])
+            getattr(case, "template", "") == "op-de-wisch"
+            or (
+                case.plan
+                and (
+                    getattr(case.plan, "template", "") == "op-de-wisch"
+                    or any(
+                        getattr(g, "section_id", "") in ODW_TITLES
+                        and getattr(g, "section_id", "") not in HAMBURG_TITLES
+                        for g in getattr(case.plan, "goals", [])
+                    )
+                )
             )
         )
         if not is_odw and bereich_id in ODW_TITLES and bereich_id not in HAMBURG_TITLES:

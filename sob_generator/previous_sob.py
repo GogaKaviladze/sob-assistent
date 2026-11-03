@@ -168,6 +168,9 @@ class PreviousPlanData(BaseModel):
     zeitraum: str = ""
     developments: str = ""
     sections: Dict[str, PlanSectionGoal] = Field(default_factory=dict)
+    parser_source: str = "bookmarks"
+    is_fallback: bool = False
+    warning: str = ""
 
     def to_compact_context(self, max_tokens: int = 500) -> str:
         """Verdichtet Klientendaten, Entwicklungen und aktive Abschnitte auf < 2.500 Zeichen (< 500 Tokens).
@@ -317,12 +320,21 @@ class UniversalPlanImporter:
             source.seek(0)
         plan = self._extract_bookmarks(source, filename=fn)
         if plan is not None and plan.sections:
+            plan.parser_source = "bookmarks"
+            plan.is_fallback = False
             return plan
 
         # 2. Fallback: Strukturierte Tabellen- und Text-Heuristik
         if hasattr(source, "seek"):
             source.seek(0)
-        return self._extract_fallback(source, filename=fn)
+        fallback_plan = self._extract_fallback(source, filename=fn)
+        fallback_plan.parser_source = "fallback"
+        fallback_plan.is_fallback = True
+        fallback_plan.warning = (
+            "⚠️ Vorbericht wurde über Heuristik/Fallback eingelesen. "
+            "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
+        )
+        return fallback_plan
 
     def _extract_bookmarks(
         self,

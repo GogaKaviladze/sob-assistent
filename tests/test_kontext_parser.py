@@ -203,3 +203,52 @@ def test_caplog_during_parsing_contains_no_zz_synth_markers(caplog):
 
     assert "ZZ_SYNTH" not in caplog.text
     assert "Synthetischer Klient" not in caplog.text
+
+
+def test_upload_plan_fails_when_no_parser_greift(test_client):
+    """Prüft Issue #23: Wenn kein Parser-Pfad greift (0 Bereiche erkannt), liefert API 422 statt stiller Teil-Erkennung."""
+    doc = docx.Document()
+    doc.add_paragraph("Kaffee kochen und Zeitung lesen.")
+    buf = io.BytesIO()
+    doc.save(buf)
+    unparseable_bytes = buf.getvalue()
+
+    res = test_client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "kein_plan.docx",
+                io.BytesIO(unparseable_bytes),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert res.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt:" in res.json()["detail"]
+
+
+def test_upload_plan_fallback_returns_visible_warning(test_client):
+    """Prüft Issue #23: Fallback-Parser liefert sichtbare Warnung in UI/API statt stiller Erkennung."""
+    fallback_bytes = build_hamburg_vorbericht(fallback=True)
+    res = test_client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "vorbericht_fallback.docx",
+                io.BytesIO(fallback_bytes),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["success"] is True
+    assert data["goals_count"] == 9
+    assert data["is_fallback"] is True
+    assert "⚠️" in data["warning"]
+
+    # Auch /api/session enthält die Warnung für UI-Wiederherstellung
+    session_data = test_client.get("/api/session").json()
+    assert session_data["has_plan"] is True
+    assert session_data["plan"]["is_fallback"] is True
+    assert "⚠️" in session_data["plan"]["warning"]

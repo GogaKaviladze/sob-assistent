@@ -248,3 +248,141 @@ class ContextBuilder:
             bereich_id=bereich_id,
             bereich_title=bereich_title,
         )
+
+    @classmethod
+    def get_review_data(cls, case: Any, bereich_id: str) -> Dict[str, Any]:
+        """Liefert strukturierte Daten für 'Bereich prüfen': Alt-SOB und zugeordnete CSV-Einträge."""
+        is_odw = bool(
+            case.plan
+            and any(
+                getattr(g, "section_id", "") in ODW_TITLES
+                and getattr(g, "section_id", "") not in HAMBURG_TITLES
+                for g in getattr(case.plan, "goals", [])
+            )
+        )
+        if not is_odw and bereich_id in ODW_TITLES and bereich_id not in HAMBURG_TITLES:
+            is_odw = True
+
+        bereich_title = get_canonical_title(bereich_id, is_odw)
+        confirmed = case.is_area_confirmed(bereich_id) if hasattr(case, "is_area_confirmed") else False
+
+        # 1. Alt-SOB Teil für diesen Bereich
+        alt_sob: Dict[str, Any] = {
+            "has_goals": False,
+            "section_id": bereich_id,
+            "section_title": bereich_title,
+            "leitziel": "",
+            "smarte_ziele": "",
+            "stand_zielerreichung": "",
+            "vorschlag_ziele": "",
+            "vorschlag_massnahmen": "",
+            "realisierung_andere": "",
+            "text": "",
+        }
+        if case.plan and getattr(case.plan, "goals", None):
+            matching_goals = [
+                g for g in case.plan.goals
+                if getattr(g, "section_id", "") == bereich_id
+            ]
+            if matching_goals:
+                g = matching_goals[0]
+                has_content = bool(
+                    getattr(g, "leitziel", "")
+                    or getattr(g, "smarte_ziele", "")
+                    or getattr(g, "stand_zielerreichung", "")
+                    or getattr(g, "vorschlag_ziele", "")
+                    or getattr(g, "vorschlag_massnahmen", "")
+                    or getattr(g, "realisierung_andere", "")
+                )
+                alt_sob["has_goals"] = has_content
+                alt_sob["leitziel"] = getattr(g, "leitziel", "")
+                alt_sob["smarte_ziele"] = getattr(g, "smarte_ziele", "")
+                alt_sob["stand_zielerreichung"] = getattr(g, "stand_zielerreichung", "")
+                alt_sob["vorschlag_ziele"] = getattr(g, "vorschlag_ziele", "")
+                alt_sob["vorschlag_massnahmen"] = getattr(g, "vorschlag_massnahmen", "")
+                alt_sob["realisierung_andere"] = getattr(g, "realisierung_andere", "")
+
+                text_lines = []
+                if getattr(g, "leitziel", ""):
+                    text_lines.append(f"Leitziel: {g.leitziel}")
+                if getattr(g, "smarte_ziele", ""):
+                    text_lines.append(f"Smartes Ziel: {g.smarte_ziele}")
+                if getattr(g, "stand_zielerreichung", ""):
+                    text_lines.append(f"Bisherige Zielerreichung: {g.stand_zielerreichung}")
+                if getattr(g, "vorschlag_ziele", ""):
+                    text_lines.append(f"Vorschlag Ziele: {g.vorschlag_ziele}")
+                if getattr(g, "vorschlag_massnahmen", ""):
+                    text_lines.append(f"Vorschlag Maßnahmen: {g.vorschlag_massnahmen}")
+                if getattr(g, "realisierung_andere", ""):
+                    text_lines.append(f"Realisierung durch andere: {g.realisierung_andere}")
+                alt_sob["text"] = "\n".join(text_lines)
+
+        # 2. CSV-Einträge
+        assigned_entries: List[Dict[str, Any]] = []
+        unassigned_entries: List[Dict[str, Any]] = []
+        total_count = 0
+
+        target_hamburg_ids: Set[str] = set()
+        if is_odw:
+            target_hamburg_ids = set(OP_DE_WISCH_TO_HAMBURG_MAP.get(bereich_id, []))
+        else:
+            target_hamburg_ids = {bereich_id}
+
+        if case.csv and getattr(case.csv, "entries", None):
+            entries = case.csv.entries
+            total_count = len(entries)
+            sorted_entries = sorted(
+                entries,
+                key=lambda e: _parse_entry_datetime(e.datum, getattr(e, "uhrzeit", "")),
+            )
+            for e in sorted_entries:
+                search_text = f"{e.kategorie} {e.text}"
+                matched_sec_ids = classify_entry_sections(search_text)
+                is_unassigned = len(matched_sec_ids) == 0
+                is_assigned = bool(matched_sec_ids & target_hamburg_ids)
+
+                entry_dict = {
+                    "datum": getattr(e, "datum", ""),
+                    "uhrzeit": getattr(e, "uhrzeit", ""),
+                    "kategorie": getattr(e, "kategorie", ""),
+                    "text": getattr(e, "text", ""),
+                    "formatted": _format_vivendi_entry(e),
+                }
+                if is_assigned:
+                    assigned_entries.append(entry_dict)
+                elif is_unassigned:
+                    unassigned_entries.append(entry_dict)
+
+        elif case.csv and getattr(case.csv, "rows", None) and case.csv.rows:
+            rows = case.csv.rows
+            headers = getattr(case.csv, "headers", [])
+            total_count = len(rows)
+            for idx, r in enumerate(rows, start=1):
+                search_text = " ".join(r)
+                matched_sec_ids = classify_entry_sections(search_text)
+                is_unassigned = len(matched_sec_ids) == 0
+                is_assigned = bool(matched_sec_ids & target_hamburg_ids)
+
+                entry_dict = {
+                    "datum": r[0] if len(r) > 0 else "",
+                    "uhrzeit": "",
+                    "kategorie": r[1] if len(r) > 1 else "",
+                    "text": " | ".join(r),
+                    "formatted": _format_generic_row(idx, r, headers),
+                }
+                if is_assigned:
+                    assigned_entries.append(entry_dict)
+                elif is_unassigned:
+                    unassigned_entries.append(entry_dict)
+
+        return {
+            "bereich_id": bereich_id,
+            "bereich_title": bereich_title,
+            "confirmed": confirmed,
+            "alt_sob": alt_sob,
+            "assigned_entries": assigned_entries,
+            "unassigned_entries": unassigned_entries,
+            "assigned_count": len(assigned_entries),
+            "unassigned_count": len(unassigned_entries),
+            "total_count": total_count,
+        }

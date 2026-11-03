@@ -257,6 +257,13 @@ def create_app(
                     detail=f"❌ Plan konnte nicht gelesen werden ({type(exc).__name__}).",
                 ) from exc
 
+            if parsed_plan.goals_count == 0:
+                logger.warning("Kein Lebensbereich im Vorbericht erkannt: goals_count=0")
+                raise HTTPException(
+                    status_code=422,
+                    detail="❌ Kein gültiger Vorbericht erkannt: Es konnten keine Lebensbereiche oder Ziele extrahiert werden. Bitte Vorlage prüfen (Hamburger SVB oder Op de Wisch).",
+                )
+
             detected_plan_client = extract_client_name_from_filename(file.filename)
             effective_plan_client = parsed_plan.client_name or detected_plan_client
             csv_client = getattr(bot.csv_data, "client_name", "") if bot.csv_data else ""
@@ -296,6 +303,9 @@ def create_app(
                 "zeitraum_von": parsed_plan.zeitraum_von,
                 "zeitraum_bis": parsed_plan.zeitraum_bis,
                 "hidden_removed": getattr(parsed_plan, "hidden_removed", 0),
+                "is_fallback": getattr(parsed_plan, "is_fallback", False),
+                "warning": getattr(parsed_plan, "warning", ""),
+                "parser_source": getattr(parsed_plan, "parser_source", ""),
             }
         elif lower_name.endswith(".txt") or lower_name.endswith(".md"):
             try:
@@ -373,6 +383,39 @@ def create_app(
             "unassigned_count": built.unassigned_count,
             "total_count": built.total_count,
             "confirmed": bot.case.is_area_confirmed(req.bereich_id),
+        }
+
+    @app.get("/api/area/{bereich_id}/review")
+    async def review_area(bereich_id: str) -> Dict[str, Any]:
+        """Liefert die zugeordneten Verlaufs-Einträge und den Alt-SOB-Teil zur fachlichen Prüfung."""
+        bot.check_ttl()
+        req = SelectAreaRequest(bereich_id=bereich_id)
+        review_data = ContextBuilder.get_review_data(bot.case, req.bereich_id)
+        logger.info(
+            "Bereich zur Prüfung aufgerufen: %s (Doku: %d+%d)",
+            req.bereich_id,
+            review_data["assigned_count"],
+            review_data["unassigned_count"],
+        )
+        return {
+            "success": True,
+            **review_data,
+        }
+
+    @app.post("/api/area/review")
+    async def review_area_post(req: SelectAreaRequest) -> Dict[str, Any]:
+        """Liefert die zugeordneten Verlaufs-Einträge und den Alt-SOB-Teil via POST."""
+        bot.check_ttl()
+        review_data = ContextBuilder.get_review_data(bot.case, req.bereich_id)
+        logger.info(
+            "Bereich zur Prüfung aufgerufen: %s (Doku: %d+%d)",
+            req.bereich_id,
+            review_data["assigned_count"],
+            review_data["unassigned_count"],
+        )
+        return {
+            "success": True,
+            **review_data,
         }
 
     @app.post("/api/area/confirm")
@@ -634,6 +677,9 @@ def create_app(
                     "goals_count": bot.plan_data.goals_count,
                     "preview": bot.plan_data.preview,
                     "goals": [g.to_dict() for g in bot.plan_data.goals],
+                    "is_fallback": getattr(bot.plan_data, "is_fallback", False),
+                    "warning": getattr(bot.plan_data, "warning", ""),
+                    "parser_source": getattr(bot.plan_data, "parser_source", ""),
                     "info": {
                         "filename": bot.plan_data.filename,
                         "client_name": bot.plan_data.client_name,

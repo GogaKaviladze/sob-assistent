@@ -371,3 +371,72 @@ def test_area_confirm_flag_ram_only():
     # Ungültige ID wird mit 422 abgewiesen
     res_bad = client.post("/api/area/confirm", json={"bereich_id": "99.9"})
     assert res_bad.status_code == 422
+
+
+def test_area_review_shows_assigned_entries_and_alt_sob():
+    """Prüft Issue #23: 'Bereich prüfen' liefert die zugeordneten CSV-Einträge und den Alt-SOB-Teil."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. Synthetischen 9-Bereich-Plan und CSV hochladen
+    plan_bytes = build_hamburg_vorbericht(fallback=False)
+    client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "vorbericht_synth.docx",
+                io.BytesIO(plan_bytes),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    csv_content = (
+        "Datum;Uhrzeit;Mitarbeiter;Kategorie;Bericht\n"
+        "01.02.2025;10:00;Pflegekraft;Wohnung;Wohnung aufgeräumt und gelüftet.\n"
+        "02.02.2025;11:00;Pflegekraft;Allgemein;Klient wirkte heute gut gelaunt.\n"
+        "03.02.2025;12:00;Pflegekraft;Freizeit;Spaziergang im Park unternommen.\n"
+    )
+    res_csv = client.post(
+        "/api/upload",
+        files={"file": ("Synthetischer_Klient_verlauf.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")},
+    )
+    assert res_csv.status_code == 200
+
+    # 2. Bereich 1.1 wählen
+    client.post("/api/area", json={"bereich_id": "1.1"})
+
+    # 3. GET /api/area/1.1/review aufrufen
+    res = client.get("/api/area/1.1/review")
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["success"] is True
+    assert data["bereich_id"] == "1.1"
+    assert data["bereich_title"] == "Wohnsituation"
+    assert data["confirmed"] is False
+
+    # Alt-SOB Ziele prüfen (aus Fixture 1.1)
+    assert data["alt_sob"]["has_goals"] is True
+    assert data["alt_sob"]["leitziel"] == "ZZ_SYNTH_1_1_LEITZIEL"
+    assert data["alt_sob"]["smarte_ziele"] == "ZZ_SYNTH_1_1_SMARTE_ZIELE"
+    assert data["alt_sob"]["stand_zielerreichung"] == "ZZ_SYNTH_1_1_BERICHT"
+
+    # CSV-Zuordnung prüfen: Wohnung gehört zu 1.1
+    assert data["assigned_count"] == 1
+    assert any("Wohnung aufgeräumt" in e["text"] for e in data["assigned_entries"])
+
+    # Allgemeiner Eintrag ohne spezifische Zuordnung landet in unassigned
+    assert data["unassigned_count"] >= 1
+    assert any("gut gelaunt" in e["text"] for e in data["unassigned_entries"])
+
+    # 4. POST /api/area/review liefert identische Daten
+    res_post = client.post("/api/area/review", json={"bereich_id": "1.1"})
+    assert res_post.status_code == 200
+    assert res_post.json()["assigned_count"] == 1
+
+    # 5. Bestätigen und erneute Prüfung zeigt confirmed=True
+    client.post("/api/area/confirm", json={"bereich_id": "1.1"})
+    res_after = client.get("/api/area/1.1/review")
+    assert res_after.json()["confirmed"] is True

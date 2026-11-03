@@ -87,6 +87,9 @@ class PlanData:
     #: True, wenn client_name nur heuristisch aus dem Dateinamen stammt (nicht für Berichtsfelder nutzen)
     client_name_from_filename: bool = False
     hidden_removed: int = 0
+    is_fallback: bool = False
+    warning: str = ""
+    parser_source: str = ""
 
     @property
     def goals_count(self) -> int:
@@ -287,6 +290,10 @@ def parse_plan_docx(
                 client_name = doc_client_name or extract_client_name_from_filename(filename)
                 raw_summary = getattr(plan_result, "developments", "") or getattr(plan_result, "raw_summary", "")
 
+                is_fallback = getattr(plan_result, "is_fallback", False)
+                warning = getattr(plan_result, "warning", "")
+                parser_source = getattr(plan_result, "parser_source", "bookmarks")
+
                 if mapped_goals:
                     return PlanData(
                         filename=filename,
@@ -297,6 +304,9 @@ def parse_plan_docx(
                         goals=mapped_goals,
                         raw_summary=raw_summary,
                         hidden_removed=hidden_removed,
+                        is_fallback=is_fallback,
+                        warning=warning,
+                        parser_source=parser_source,
                     )
             elif hasattr(plan_result, "goals"):
                 # Mapping falls anderes Dataclass-Objekt
@@ -325,6 +335,9 @@ def parse_plan_docx(
                     goals=mapped_goals,
                     raw_summary=getattr(plan_result, "raw_summary", "") or getattr(plan_result, "developments", ""),
                     hidden_removed=hidden_removed,
+                    is_fallback=getattr(plan_result, "is_fallback", False),
+                    warning=getattr(plan_result, "warning", ""),
+                    parser_source=getattr(plan_result, "parser_source", "fallback"),
                 )
     except IncompletePlanError:
         raise
@@ -339,6 +352,9 @@ def parse_plan_docx(
     zeitraum_von = ""
     zeitraum_bis = ""
     extracted_goals: List[PlanGoalItem] = []
+    is_fallback = False
+    warning = ""
+    parser_source = "bookmarks"
 
     try:
         if hasattr(target_source, "seek"):
@@ -422,6 +438,12 @@ def parse_plan_docx(
 
             # Falls immer noch keine Ziele via Bookmarks: Paragraphen & Tabellen analysieren
             if not extracted_goals:
+                is_fallback = True
+                parser_source = "text_fallback"
+                warning = (
+                    "⚠️ Vorbericht wurde über Text-Heuristik (Fallback) eingelesen. "
+                    "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
+                )
                 # Tabellen scannen
                 for table in doc.tables:
                     for row in table.rows:
@@ -476,4 +498,7 @@ def parse_plan_docx(
         zeitraum_bis=zeitraum_bis,
         goals=extracted_goals,
         hidden_removed=hidden_removed,
+        is_fallback=is_fallback,
+        warning=warning,
+        parser_source=parser_source,
     )

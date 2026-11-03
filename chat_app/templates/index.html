@@ -1357,6 +1357,10 @@
           appendSystemNotification(
             `✅ CSV '${data.filename}' erfolgreich geladen${notifCount}`
           );
+          if (data.warning) {
+            appendSystemNotification(data.warning);
+            showToast(data.warning);
+          }
         } else {
           showModalError("Fehler beim Laden", data.detail || data.error || "Unbekannter Fehler");
         }
@@ -1491,7 +1495,12 @@
           appendSystemNotification(
             `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
           );
-          showToast(`✓ Vorbericht geladen: ${data.filename}`);
+          if (data.warning) {
+            appendSystemNotification(data.warning);
+            showToast(data.warning);
+          } else {
+            showToast(`✓ Vorbericht geladen: ${data.filename}`);
+          }
         } else {
           showModalError("Fehler beim Vorbericht-Laden", data.detail || data.error || "Unbekannter Fehler");
           if (planFileInput) planFileInput.value = "";

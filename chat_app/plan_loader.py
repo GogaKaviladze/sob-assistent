@@ -86,6 +86,7 @@ class PlanData:
     raw_summary: str = ""
     #: True, wenn client_name nur heuristisch aus dem Dateinamen stammt (nicht für Berichtsfelder nutzen)
     client_name_from_filename: bool = False
+    is_fallback: bool = False
     hidden_removed: int = 0
 
     @property
@@ -239,8 +240,19 @@ def parse_plan_docx(
             if hasattr(plan_result, "sections"):
                 mapped_goals: List[PlanGoalItem] = []
                 sections_dict = getattr(plan_result, "sections", {})
-                items = sections_dict.values() if isinstance(sections_dict, dict) else sections_dict
+                items = list(sections_dict.values()) if isinstance(sections_dict, dict) else list(sections_dict)
                 section_title_map = {d.id: d.title for d in SECTION_DEFINITIONS}
+                any_section_content = any(
+                    bool(
+                        getattr(g, "leitziel", "")
+                        or getattr(g, "smarte_ziele", "")
+                        or getattr(g, "stand_zielerreichung", "")
+                        or getattr(g, "vorschlag_ziele", "")
+                        or getattr(g, "vorschlag_massnahmen", "")
+                        or getattr(g, "realisierung_andere", "")
+                    )
+                    for g in items
+                )
                 for g in items:
                     has_content = bool(
                         getattr(g, "leitziel", "")
@@ -250,7 +262,7 @@ def parse_plan_docx(
                         or getattr(g, "vorschlag_massnahmen", "")
                     )
                     applies = getattr(g, "applies", True)
-                    if not has_content and not applies:
+                    if not any_section_content and not has_content and not applies:
                         continue
 
                     sec_id = getattr(g, "section_id", "")
@@ -284,14 +296,18 @@ def parse_plan_docx(
                         zeitraum_von = zeitraum_str.strip()
 
                 doc_client_name = getattr(plan_result, "client_name", "")
+                result_from_fn = bool(getattr(plan_result, "client_name_from_filename", False))
                 client_name = doc_client_name or extract_client_name_from_filename(filename)
+                from_fn = bool(client_name) and (not doc_client_name or result_from_fn)
+                is_fb = bool(getattr(plan_result, "is_fallback", False))
                 raw_summary = getattr(plan_result, "developments", "") or getattr(plan_result, "raw_summary", "")
 
                 if mapped_goals:
                     return PlanData(
                         filename=filename,
                         client_name=client_name,
-                        client_name_from_filename=bool(client_name) and not doc_client_name,
+                        client_name_from_filename=from_fn,
+                        is_fallback=is_fb,
                         zeitraum_von=zeitraum_von,
                         zeitraum_bis=zeitraum_bis,
                         goals=mapped_goals,
@@ -472,6 +488,7 @@ def parse_plan_docx(
         filename=filename,
         client_name=client_name,
         client_name_from_filename=client_name_from_filename,
+        is_fallback=True,
         zeitraum_von=zeitraum_von,
         zeitraum_bis=zeitraum_bis,
         goals=extracted_goals,

@@ -119,6 +119,7 @@ class CsvData:
     total_rows: int
     raw_text: str = ""
     client_name: str = ""
+    client_name_from_filename: bool = False
     entries: List[DocumentationEntry] = field(default_factory=list)
     entries_total: int = 0
     entries_in_context: int = 0
@@ -455,6 +456,7 @@ def _extract_fallback_vivendi_entries(content: str) -> List[DocumentationEntry]:
 
 def parse_csv_content(content: str, filename: str = "daten.csv", client_name: str = "") -> CsvData:
     """Parst einen CSV-Textstring robust (unterstützt Vivendi-PD und generische Formate)."""
+    from_fn = bool(client_name and client_name != "Klient*in (anonymisiert)")
     if not content or not content.strip():
         return CsvData(
             filename=filename,
@@ -463,6 +465,7 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
             total_rows=0,
             raw_text="",
             client_name=client_name,
+            client_name_from_filename=from_fn,
             entries=[],
             entries_total=0,
             entries_in_context=0,
@@ -491,6 +494,7 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
                 total_rows=len(entries),
                 raw_text=content,
                 client_name=final_client,
+                client_name_from_filename=not bool(det_client) and from_fn,
                 entries=entries,
                 entries_total=len(entries),
                 entries_in_context=0,
@@ -514,6 +518,7 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
                 total_rows=len(fallback_entries),
                 raw_text=content,
                 client_name=client_name,
+                client_name_from_filename=from_fn,
                 entries=fallback_entries,
                 entries_total=len(fallback_entries),
                 entries_in_context=0,
@@ -542,6 +547,7 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
             total_rows=0,
             raw_text=content,
             client_name=client_name,
+            client_name_from_filename=from_fn,
             entries=[],
             entries_total=0,
             entries_in_context=0,
@@ -578,6 +584,7 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
         total_rows=len(rows),
         raw_text=content,
         client_name=client_name,
+        client_name_from_filename=from_fn,
         entries=[],
         entries_total=len(rows),
         entries_in_context=0,

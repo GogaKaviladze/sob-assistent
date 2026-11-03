@@ -75,6 +75,73 @@ class SelectAreaRequest(BaseModel):
 
 DEFAULT_DOCX_PARSE_TIMEOUT = 10.0
 
+_GENERIC_CLIENT_NAMES = {
+    "klient*in (anonymisiert)",
+    "klient*in",
+    "anonymisiert",
+    "synthetischer klient",
+    "vorlage",
+    "fosvorlage",
+    "",
+}
+
+
+def _canonical_client_name(name: str) -> str:
+    """Normalisiert Klientennamen ('Nachname, Vorname' -> 'vorname nachname') für den Fallabgleich."""
+    raw = (name or "").strip()
+    if not raw or raw.lower() in _GENERIC_CLIENT_NAMES:
+        return ""
+    if any(ph in raw.lower() for ph in ("name, vorname", "klient*in", "klientin")):
+        return ""
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",", 1)]
+        raw = f"{parts[1]} {parts[0]}".strip()
+    return " ".join(raw.lower().split())
+
+
+def _evaluate_client_match(
+    existing_name: str,
+    existing_from_filename: bool,
+    new_name: str,
+    new_from_filename: bool,
+) -> tuple[bool, str]:
+    """Prüft auf Klientenkonflikt zwischen bestehendem Fall und neuem Upload.
+
+    Gibt (client_conflict, warning) zurück:
+    - client_conflict=True nur wenn beide Namen sicher erkannt (nicht aus Dateinamen) und abweichend sind.
+    - warning (nicht-leer) wenn ein abweichender oder fehlender Name unsicher ist (kein Reset).
+    """
+    c_exist = _canonical_client_name(existing_name)
+    c_new = _canonical_client_name(new_name)
+    if not c_exist and not c_new:
+        return False, ""
+    if not c_exist or not c_new:
+        return (
+            False,
+            "⚠️ Klientenname in einer der Dateien nicht sicher erkannt – kein automatischer Fall-Reset. Bitte Fallzugehörigkeit prüfen.",
+        )
+
+    exist_tokens = set(c_exist.split())
+    new_tokens = set(c_new.split())
+    same_client = (
+        c_exist == c_new
+        or c_exist in c_new
+        or c_new in c_exist
+        or (len(exist_tokens) >= 2 and exist_tokens == new_tokens)
+    )
+    if same_client:
+        return False, ""
+
+    exist_confident = not existing_from_filename and len(exist_tokens) >= 2
+    new_confident = not new_from_filename and len(new_tokens) >= 2
+    if exist_confident and new_confident:
+        return True, ""
+
+    return (
+        False,
+        "⚠️ Klientenname nicht sicher erkannt (nur aus Dateiname abgeleitet oder unvollständig) – kein automatischer Fall-Reset. Bitte Fallzugehörigkeit prüfen.",
+    )
+
 
 def get_docx_parse_timeout() -> float:
     raw = os.getenv("SOB_DOCX_PARSE_TIMEOUT", "").strip()
@@ -168,21 +235,21 @@ def create_app(
         is_vivendi = bool(parsed_csv.entries) or ("vivendi" in file.filename.lower())
         source = "Vivendi PD Verlaufsbericht" if is_vivendi else f"Verlaufsdokumentation ({file.filename})"
 
+        warning = ""
         if not new_case:
             # Konfliktprüfung für harten Fall-Reset (Issue #133):
-            # (a) Dateityp bereits geladen, (b) Chat-Verlauf existiert, (c) Klientenkonflikt
+            # (a) Dateityp bereits geladen, (b) Chat-Verlauf existiert, (c) sicher erkannter Klientenkonflikt
             has_same_type = bot.has_csv
             has_history = len(bot.messages) > 0
-            plan_client = getattr(bot.plan_data, "client_name", "") if bot.plan_data else ""
             client_conflict = False
-            effective_csv_client = client_name if client_name != "Klient*in (anonymisiert)" else detected_client
-            if plan_client and effective_csv_client:
-                p_norm = plan_client.strip().lower()
-                d_norm = effective_csv_client.strip().lower()
-                generic = {"klient*in (anonymisiert)", "klient*in", "anonymisiert", "synthetischer klient", ""}
-                if p_norm not in generic and d_norm not in generic:
-                    if p_norm != d_norm and p_norm not in d_norm and d_norm not in p_norm:
-                        client_conflict = True
+            if bot.plan_data is not None:
+                plan_client = getattr(bot.plan_data, "client_name", "")
+                plan_from_fn = bool(getattr(bot.plan_data, "client_name_from_filename", False))
+                effective_csv_client = client_name if client_name != "Klient*in (anonymisiert)" else detected_client
+                csv_from_fn = bool(getattr(parsed_csv, "client_name_from_filename", False))
+                client_conflict, warning = _evaluate_client_match(
+                    plan_client, plan_from_fn, effective_csv_client, csv_from_fn
+                )
 
             if has_same_type or has_history or client_conflict:
                 return JSONResponse(
@@ -201,7 +268,7 @@ def create_app(
         # Erste 3 Zeilen als Vorschau für die UI
         preview_lines = parsed_csv.to_context_text(max_rows=3, update_counters=False)
 
-        return {
+        resp_payload: Dict[str, Any] = {
             "success": True,
             "filename": parsed_csv.filename,
             "total_rows": parsed_csv.total_rows,
@@ -213,6 +280,9 @@ def create_app(
             "client_name": client_name,
             "source": source,
         }
+        if warning:
+            resp_payload["warning"] = warning
+        return resp_payload
 
     @app.post("/api/upload-plan")
     async def upload_plan(
@@ -259,15 +329,17 @@ def create_app(
 
             detected_plan_client = extract_client_name_from_filename(file.filename)
             effective_plan_client = parsed_plan.client_name or detected_plan_client
-            csv_client = getattr(bot.csv_data, "client_name", "") if bot.csv_data else ""
+            plan_from_fn = bool(
+                getattr(parsed_plan, "client_name_from_filename", False) or not parsed_plan.client_name
+            )
             client_conflict = False
-            if csv_client and effective_plan_client:
-                c_norm = csv_client.strip().lower()
-                p_norm = effective_plan_client.strip().lower()
-                generic = {"klient*in (anonymisiert)", "klient*in", "anonymisiert", "synthetischer klient", ""}
-                if c_norm not in generic and p_norm not in generic:
-                    if c_norm != p_norm and c_norm not in p_norm and p_norm not in c_norm:
-                        client_conflict = True
+            warning = ""
+            if bot.csv_data is not None:
+                csv_client = getattr(bot.csv_data, "client_name", "")
+                csv_from_fn = bool(getattr(bot.csv_data, "client_name_from_filename", False))
+                client_conflict, warning = _evaluate_client_match(
+                    csv_client, csv_from_fn, effective_plan_client, plan_from_fn
+                )
 
             if not new_case:
                 has_same_type = bot.has_plan
@@ -286,7 +358,7 @@ def create_app(
             bot.set_plan(parsed_plan)
             log_plan_loaded(goals_count=parsed_plan.goals_count)
 
-            return {
+            plan_resp: Dict[str, Any] = {
                 "success": True,
                 "has_plan": True,
                 "filename": parsed_plan.filename,
@@ -297,6 +369,9 @@ def create_app(
                 "zeitraum_bis": parsed_plan.zeitraum_bis,
                 "hidden_removed": getattr(parsed_plan, "hidden_removed", 0),
             }
+            if warning:
+                plan_resp["warning"] = warning
+            return plan_resp
         elif lower_name.endswith(".txt") or lower_name.endswith(".md"):
             try:
                 content_text = content_bytes.decode("utf-8-sig")

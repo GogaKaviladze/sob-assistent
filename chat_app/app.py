@@ -11,15 +11,19 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from sob_generator.docx_safety import UnsafeDocxError
+from sob_generator.llm.sections import SECTION_DEFINITIONS
+from sob_generator.llm.sections_op_de_wisch import OP_DE_WISCH_SECTION_DEFINITIONS
 from .chatbot import ReflectionChatbot, ReflectionEngine, get_candidate_model_directories
+from .context_builder import ContextBuilder
 from .csv_loader import CsvData, parse_csv_content
 from .docx_exporter import (
     DocxExportError,
@@ -58,6 +62,17 @@ class SetPlanRequest(BaseModel):
     title: Optional[str] = None
 
 
+# Allowlist der gültigen Lebensbereiche (Hamburg 1.1-3, Op de Wisch 1-9)
+ValidAreaId = Literal[
+    "1.1", "1.2", "1.3", "1.4", "1.5", "2.1", "2.2", "2.3", "3",
+    "1", "2", "4", "5", "6", "7", "8", "9",
+]
+
+
+class SelectAreaRequest(BaseModel):
+    bereich_id: ValidAreaId
+
+
 DEFAULT_DOCX_PARSE_TIMEOUT = 10.0
 
 
@@ -88,6 +103,19 @@ def create_app(
         openapi_url=None,
     )
     app.add_middleware(LimitUploadSizeMiddleware, max_bytes=limit)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        # M5: Rohwerte niemals in Response Body oder Logs spiegeln
+        clean_errors = []
+        for err in exc.errors():
+            clean_err = {k: v for k, v in err.items() if k != "input"}
+            clean_errors.append(clean_err)
+        return JSONResponse(
+            status_code=422,
+            content={"detail": clean_errors},
+        )
+
     bot = chatbot or ReflectionChatbot()
 
     @app.get("/", response_class=HTMLResponse)
@@ -307,6 +335,57 @@ def create_app(
                 "zeitraum_bis": "",
                 "preview": (bot.plan_context[:200] if bot.plan_context else ""),
             }
+
+    @app.post("/api/area")
+    async def select_area(req: SelectAreaRequest) -> Dict[str, Any]:
+        """Wählt den aktiven Lebensbereich für den Fachdialog aus (M5)."""
+        bot.check_ttl()
+        # Prüfe Kompatibilität mit geladenem Vorbericht
+        is_odw = bool(
+            bot.plan_data
+            and any(
+                getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                for g in getattr(bot.plan_data, "goals", [])
+            )
+        )
+        if is_odw and req.bereich_id in {"1.1", "1.2", "1.3", "1.4", "1.5", "2.1", "2.2", "2.3"}:
+            raise HTTPException(status_code=422, detail="Ungültiger Lebensbereich für geladene Op de Wisch Vorlage.")
+        if not is_odw and bot.plan_data and req.bereich_id in {"1", "2", "4", "5", "6", "7", "8", "9"}:
+            raise HTTPException(status_code=422, detail="Ungültiger Lebensbereich für Hamburger Vorlage.")
+
+        bot.selected_bereich_id = req.bereich_id
+        built = ContextBuilder.build(bot.case, req.bereich_id)
+
+        # M2: Nur Bereichs-ID und Zähler loggen
+        logger.info(
+            "Lebensbereich ausgewählt: %s (Doku: %d+%d von %d)",
+            req.bereich_id,
+            built.assigned_count,
+            built.unassigned_count,
+            built.total_count,
+        )
+
+        return {
+            "success": True,
+            "bereich_id": req.bereich_id,
+            "title": built.bereich_title,
+            "assigned_count": built.assigned_count,
+            "unassigned_count": built.unassigned_count,
+            "total_count": built.total_count,
+            "confirmed": bot.case.is_area_confirmed(req.bereich_id),
+        }
+
+    @app.post("/api/area/confirm")
+    async def confirm_area(req: SelectAreaRequest) -> Dict[str, Any]:
+        """Setzt die fachliche Bestätigung 'Bereich geprüft' im RAM (Legal 1)."""
+        bot.check_ttl()
+        bot.case.confirm_area(req.bereich_id)
+        logger.info("Lebensbereich bestätigt: %s", req.bereich_id)
+        return {
+            "success": True,
+            "bereich_id": req.bereich_id,
+            "confirmed": True,
+        }
 
     @app.post("/api/chat-stream")
     async def chat_stream(req: ChatMessageRequest):
@@ -579,6 +658,35 @@ def create_app(
         is_heuristic = isinstance(bot.provider, ReflectionEngine) if bot.provider else False
         kv_warning = getattr(bot.provider, "kv_clear_warning", None) if bot.provider else None
 
+        selected_area_info = None
+        if bot.selected_bereich_id:
+            built = ContextBuilder.build(bot.case, bot.selected_bereich_id)
+            selected_area_info = {
+                "id": bot.selected_bereich_id,
+                "title": built.bereich_title,
+                "assigned_count": built.assigned_count,
+                "unassigned_count": built.unassigned_count,
+                "total_count": built.total_count,
+                "confirmed": bot.case.is_area_confirmed(bot.selected_bereich_id),
+            }
+
+        is_odw = bool(
+            bot.plan_data
+            and any(
+                getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                for g in getattr(bot.plan_data, "goals", [])
+            )
+        )
+        area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+        available_areas = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "confirmed": bot.case.is_area_confirmed(s.id),
+            }
+            for s in area_defs
+        ]
+
         return {
             "fall_id": bot.case.fall_id,
             "case_closed_reason": closed_reason,
@@ -593,6 +701,8 @@ def create_app(
             "csv": csv_info,
             "plan": plan_info,
             "model": bot.model_info,
+            "selected_area": selected_area_info,
+            "available_areas": available_areas,
             "messages": bot.get_history(),
         }
 

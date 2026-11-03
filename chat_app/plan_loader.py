@@ -148,7 +148,7 @@ class PlanData:
 
     def to_context_text(self) -> str:
         """Formatiert den Gesamtplan für den Kontext des LLM-Systemprompts."""
-        lines = [f"Bisheriger Gesamtplan / Vorbericht (Datei: {self.filename}):"]
+        lines = ["Bisheriger Gesamtplan / Vorbericht:"]
         if self.client_name:
             lines.append(f"Klient:in: {self.client_name}")
         if self.zeitraum_von or self.zeitraum_bis:

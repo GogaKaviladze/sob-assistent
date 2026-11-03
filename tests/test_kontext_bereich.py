@@ -371,3 +371,116 @@ def test_area_confirm_flag_ram_only():
     # Ungültige ID wird mit 422 abgewiesen
     res_bad = client.post("/api/area/confirm", json={"bereich_id": "99.9"})
     assert res_bad.status_code == 422
+
+
+def test_chat_stream_without_confirmed_area_returns_409_and_does_not_call_llm(caplog):
+    """POST /api/chat-stream ohne bestätigten Bereich (wenn Plan geladen) -> 409, kein Modellaufruf."""
+    mock_llm = QuickMockLLM(reply="Synthetische Modellantwort")
+    mock_llm.generate = MagicMock(wraps=mock_llm.generate)
+    mock_llm.generate_stream = MagicMock(wraps=mock_llm.generate_stream)
+
+    bot = ReflectionChatbot(provider=mock_llm)
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    docx_bytes = build_hamburg_vorbericht()
+    with caplog.at_level(logging.DEBUG):
+        res_plan = client.post(
+            "/api/upload-plan",
+            files={"file": ("vorbericht_synth.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        )
+        assert res_plan.status_code == 200
+
+        # 1. Ohne gewählten/bestätigten Bereich -> 409
+        res_no_area = client.post("/api/chat-stream", json={"message": "Frage zum Wohnen"})
+        assert res_no_area.status_code == 409
+        assert res_no_area.json()["detail"].startswith("❌ Bitte zuerst einen Lebensbereich wählen")
+        mock_llm.generate.assert_not_called()
+        mock_llm.generate_stream.assert_not_called()
+        assert len(mock_llm.last_messages) == 0
+
+        # 2. Bereich nur gewählt, aber noch nicht bestätigt -> 409
+        res_sel = client.post("/api/area", json={"bereich_id": "1.4"})
+        assert res_sel.status_code == 200
+        res_unconfirmed = client.post("/api/chat-stream", json={"message": "Frage zum Wohnen"})
+        assert res_unconfirmed.status_code == 409
+        assert res_unconfirmed.json()["detail"].startswith("❌ Bitte zuerst einen Lebensbereich wählen")
+        mock_llm.generate.assert_not_called()
+        mock_llm.generate_stream.assert_not_called()
+        assert len(mock_llm.last_messages) == 0
+
+        # 3. Nach Bestätigung -> 200 und Modell wird aufgerufen
+        res_conf = client.post("/api/area/confirm", json={"bereich_id": "1.4"})
+        assert res_conf.status_code == 200
+        res_ok = client.post("/api/chat-stream", json={"message": "Frage zu 1.4"})
+        assert res_ok.status_code == 200
+        mock_llm.generate_stream.assert_called_once()
+
+    assert "Synthetischer Klient" not in caplog.text
+
+
+def test_area_confirm_validates_against_loaded_template(caplog):
+    """POST /api/area/confirm und POST /api/area prüfen bereich_id gegen die Bereiche der geladenen Vorlage."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. Hamburger Vorlage geladen -> Op-de-Wisch-Bereich "4" ist unbekannt für diese Vorlage
+    docx_bytes = build_hamburg_vorbericht()
+    with caplog.at_level(logging.DEBUG):
+        res_plan = client.post(
+            "/api/upload-plan",
+            files={"file": ("vorbericht_synth.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        )
+        assert res_plan.status_code == 200
+
+        res_area_bad = client.post("/api/area", json={"bereich_id": "4"})
+        assert res_area_bad.status_code == 422
+        assert res_area_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+
+        res_conf_bad = client.post("/api/area/confirm", json={"bereich_id": "4"})
+        assert res_conf_bad.status_code == 422
+        assert res_conf_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+        assert bot.case.is_area_confirmed("4") is False
+
+        # 2. Op-de-Wisch-Vorlage im RAM -> Hamburger Bereich "1.4" ist unbekannt für diese Vorlage
+        bot.set_plan(
+            PlanData(
+                filename="odw_synth.docx",
+                client_name="Synthetischer Klient",
+                goals=[PlanGoalItem(section_id="4", section_title="Wohnen")],
+            )
+        )
+        res_area_odw_bad = client.post("/api/area", json={"bereich_id": "1.4"})
+        assert res_area_odw_bad.status_code == 422
+        assert res_area_odw_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+
+        res_conf_odw_bad = client.post("/api/area/confirm", json={"bereich_id": "1.4"})
+        assert res_conf_odw_bad.status_code == 422
+        assert res_conf_odw_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+        assert bot.case.is_area_confirmed("1.4") is False
+
+    assert "Synthetischer Klient" not in caplog.text
+
+
+def test_ui_send_message_shows_server_detail_on_error_status():
+    """Prüft, dass sendMessage in index.html bei !response.ok (z. B. 409) errData.detail via showModalError anzeigt."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    res = client.get("/")
+    assert res.status_code == 200
+    html = res.text
+
+    start_idx = html.find("async function sendMessage()")
+    assert start_idx != -1
+    end_idx = html.find("function setChipsDisabled", start_idx)
+    send_msg_block = html[start_idx:end_idx]
+
+    # Kein unbedingtes throw new Error("HTTP Fehler " + response.status) bei !response.ok für 409
+    assert 'throw new Error("HTTP Fehler " + response.status)' not in send_msg_block
+    assert "errData.detail" in send_msg_block
+    assert "showModalError" in send_msg_block
+
+

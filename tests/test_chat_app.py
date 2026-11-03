@@ -687,7 +687,11 @@ def test_chat_stream_endpoint_with_csv_and_plan(client, tmp_path):
     sample_file = _create_sample_plan_docx(tmp_path)
     client.post("/api/upload-plan", files={"file": ("Hans_Peter_SVB_ausgefuellt.docx", io.BytesIO(sample_file.read_bytes()), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")})
 
-    # 3. Chat Streaming aufrufen
+    # 3. Bereich wählen und bestätigen
+    client.post("/api/area", json={"bereich_id": "1.1"})
+    client.post("/api/area/confirm", json={"bereich_id": "1.1"})
+
+    # 4. Chat Streaming aufrufen
     stream_res = client.post("/api/chat-stream", json={"message": "Wie passen die Verlaufsdaten zu den Vorberichtszielen?"})
     assert stream_res.status_code == 200
     assert "text/event-stream" in stream_res.headers["content-type"]

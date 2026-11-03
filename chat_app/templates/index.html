@@ -2004,13 +2004,12 @@
         });
 
         if (!response.ok) {
-          if (response.status === 503) {
-            const errData = await response.json().catch(() => ({}));
-            contentDiv.closest('.message')?.remove();
-            showModalError("Kein Modell geladen", errData.detail || "Kein Modell geladen.");
-            return;
-          }
-          throw new Error("HTTP Fehler " + response.status);
+          const errData = await response.json().catch(() => ({}));
+          contentDiv.closest('.message')?.remove();
+          const title = response.status === 503 ? "Kein Modell geladen" : "Fehler bei Chat-Anfrage";
+          const fallbackMsg = response.status === 503 ? "Kein Modell geladen." : `HTTP Fehler ${response.status}`;
+          showModalError(title, errData.detail || fallbackMsg);
+          return;
         }
 
         const reader = response.body.getReader();

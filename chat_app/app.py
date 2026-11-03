@@ -336,22 +336,25 @@ def create_app(
                 "preview": (bot.plan_context[:200] if bot.plan_context else ""),
             }
 
+    def _validate_area_for_template(bereich_id: str) -> None:
+        """Prüft bereich_id gegen die Bereiche der geladenen Vorlage."""
+        if not bot.plan_data:
+            return
+        is_odw = any(
+            getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+            for g in getattr(bot.plan_data, "goals", [])
+        )
+        valid_ids = {
+            s.id for s in (OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS)
+        }
+        if bereich_id not in valid_ids:
+            raise HTTPException(status_code=422, detail="❌ Bereich gehört nicht zur Vorlage")
+
     @app.post("/api/area")
     async def select_area(req: SelectAreaRequest) -> Dict[str, Any]:
         """Wählt den aktiven Lebensbereich für den Fachdialog aus (M5)."""
         bot.check_ttl()
-        # Prüfe Kompatibilität mit geladenem Vorbericht
-        is_odw = bool(
-            bot.plan_data
-            and any(
-                getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                for g in getattr(bot.plan_data, "goals", [])
-            )
-        )
-        if is_odw and req.bereich_id in {"1.1", "1.2", "1.3", "1.4", "1.5", "2.1", "2.2", "2.3"}:
-            raise HTTPException(status_code=422, detail="Ungültiger Lebensbereich für geladene Op de Wisch Vorlage.")
-        if not is_odw and bot.plan_data and req.bereich_id in {"1", "2", "4", "5", "6", "7", "8", "9"}:
-            raise HTTPException(status_code=422, detail="Ungültiger Lebensbereich für Hamburger Vorlage.")
+        _validate_area_for_template(req.bereich_id)
 
         bot.selected_bereich_id = req.bereich_id
         built = ContextBuilder.build(bot.case, req.bereich_id)
@@ -379,6 +382,7 @@ def create_app(
     async def confirm_area(req: SelectAreaRequest) -> Dict[str, Any]:
         """Setzt die fachliche Bestätigung 'Bereich geprüft' im RAM (Legal 1)."""
         bot.check_ttl()
+        _validate_area_for_template(req.bereich_id)
         bot.case.confirm_area(req.bereich_id)
         logger.info("Lebensbereich bestätigt: %s", req.bereich_id)
         return {
@@ -391,6 +395,15 @@ def create_app(
     async def chat_stream(req: ChatMessageRequest):
         """Streamt die Modellantwort Token für Token via Server-Sent Events (SSE)."""
         bot.check_ttl()
+        if bot.has_plan and (
+            not bot.selected_bereich_id
+            or not bot.case.is_area_confirmed(bot.selected_bereich_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="❌ Bitte zuerst einen Lebensbereich wählen",
+            )
+
         if bot.provider is None:
             reason = bot.model_error or "Modelldatei fehlt"
             raise HTTPException(status_code=503, detail=f"❌ Kein Modell geladen: {reason}")

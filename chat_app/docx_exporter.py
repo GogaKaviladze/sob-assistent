@@ -13,13 +13,14 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from sob_generator.llm.sections import SECTION_DEFINITIONS
 from sob_generator.models import ClientData, ReportDraft, ReportMeta, ReportSection
 from sob_generator.report_template import TEMPLATE_REGISTRY, ReportTemplate
 
-from .chatbot import ReflectionChatbot
+if TYPE_CHECKING:
+    from .chatbot import ReflectionChatbot
 
 
 class DocxExportError(Exception):

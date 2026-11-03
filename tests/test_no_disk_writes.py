@@ -129,7 +129,19 @@ def test_redesign_no_disk_writes(monkeypatch):
         )
         assert res_plan.status_code == 200
 
-        # C) Chat-Stream ausführen
+        # C) Bereichswahl, Bereichswechsel und Bestätigung (Issue #136, RAM-only)
+        res_area = client.post("/api/area", json={"bereich_id": "1.1"})
+        assert res_area.status_code == 200
+
+        res_area_switch = client.post("/api/area", json={"bereich_id": "1.4"})
+        assert res_area_switch.status_code == 200
+        assert bot.selected_bereich_id == "1.4"
+
+        res_confirm = client.post("/api/area/confirm", json={"bereich_id": "1.4"})
+        assert res_confirm.status_code == 200
+        assert bot.case.is_area_confirmed("1.4") is True
+
+        # D) Chat-Stream ausführen
         res_chat = client.post(
             "/api/chat-stream",
             json={"message": "Wie ist der aktuelle Stand im Wohnbereich?"},
@@ -137,17 +149,17 @@ def test_redesign_no_disk_writes(monkeypatch):
         assert res_chat.status_code == 200
         assert "Synthetische Antwort" in res_chat.text
 
-        # D) Markdown-Export abrufen
+        # E) Markdown-Export abrufen
         res_exp_md = client.get("/api/export")
         assert res_exp_md.status_code == 200
         assert "# Fachdialog" in res_exp_md.text
 
-        # E) DOCX-Export abrufen
+        # F) DOCX-Export abrufen
         res_exp_docx = client.get("/api/export/docx?template=hamburg")
         assert res_exp_docx.status_code == 200
         assert len(res_exp_docx.content) > 0
 
-        # F) Reset ausführen
+        # G) Reset ausführen
         res_reset = client.post("/api/reset")
         assert res_reset.status_code == 200
 

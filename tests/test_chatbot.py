@@ -6,14 +6,17 @@ from typing import Generator, List, Dict
 
 import pytest
 
+from chat_app.budget import (
+    BASE_CTX,
+    calculate_budget_table,
+    PromptTooLongError,
+)
 from chat_app.chatbot import (
     DEFAULT_CSV_FALLBACK,
     DEFAULT_PLAN_FALLBACK,
-    MAX_PLAN_CHARS,
     LLMProvider,
     ReflectionChatbot,
     ReflectionEngine,
-    format_plan_context,
 )
 from chat_app.csv_loader import parse_csv_content
 
@@ -24,10 +27,17 @@ class MockLLM(LLMProvider):
     model_name: str = "Mock-Qwen-7B"
     is_real_llm: bool = True
     details: str = "Mock Provider für Architekturtests"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
 
     def __init__(self, reply: str = "Antwort auf Augenhöhe"):
         self.reply = reply
         self.last_messages: List[Dict[str, str]] = []
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def generate(self, messages: List[Dict[str, str]]) -> str:
         self.last_messages = [dict(m) for m in messages]
@@ -40,33 +50,29 @@ class MockLLM(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
-# 1. Tests für format_plan_context & Token-Budgetierung
+# 1. Tests für Token-Budgetierung
 # ---------------------------------------------------------------------------
 
-def test_format_plan_context_fallback_on_empty():
-    """Prüft transparenten Fallback-Text bei fehlendem oder leerem Vorbericht."""
-    assert format_plan_context(None) == DEFAULT_PLAN_FALLBACK
-    assert format_plan_context("") == DEFAULT_PLAN_FALLBACK
-    assert format_plan_context("   \n\t   ") == DEFAULT_PLAN_FALLBACK
-    assert "Kein vorheriger Gesamtplan" in DEFAULT_PLAN_FALLBACK
+def test_budget_table_sum_matches_context_size():
+    """Prüft, dass die Budget-Tabelle bei 16384 und 8192 die Summe exakt einhält."""
+    table_16k = calculate_budget_table(16384)
+    assert sum(table_16k.values()) == 16384
+    assert table_16k["vorbericht"] == 2000
+    assert table_16k["verlauf_doku"] == 5500
+
+    table_8k = calculate_budget_table(8192)
+    assert sum(table_8k.values()) == 8192
+    assert table_8k["vorbericht"] == 1000
+    assert table_8k["verlauf_doku"] == 2750
 
 
-def test_format_plan_context_within_budget():
-    """Prüft, dass ein kurzer Plan-Kontext unverändert übernommen wird."""
-    sample = "Leitziel: Selbstständige Tagesstrukturierung. Teilziel: Wöchentlicher Einkauf."
-    formatted = format_plan_context(sample)
-    assert formatted == sample
-
-
-def test_format_plan_context_truncation_enforces_budget():
-    """Prüft, dass überlange Vorberichte strikt auf <= MAX_PLAN_CHARS gekürzt werden."""
-    huge_plan = "Ziel-Dokumentation: " + ("Dies ist ein wichtiger historischer Eintrag. " * 150)
-    assert len(huge_plan) > MAX_PLAN_CHARS
-
-    formatted = format_plan_context(huge_plan, max_chars=MAX_PLAN_CHARS)
-    assert len(formatted) <= MAX_PLAN_CHARS
-    assert "... [Vorbericht-Kontext auf Budget von ca. 500 Tokens gekürzt]" in formatted
-    assert formatted.startswith("Ziel-Dokumentation:")
+def test_fit_context_for_prompt_within_budget():
+    """Prüft, dass der Prompt bei kleinem Inhalt ungekürzt bleibt."""
+    bot = ReflectionChatbot(provider=MockLLM())
+    messages, status = bot.fit_context_for_prompt(user_message="Eine kurze Frage.")
+    assert len(messages) >= 2
+    assert status.vorbericht_complete is True
+    assert status.dropped_messages == 0
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +276,11 @@ def test_chatbot_turn_serialization_prevents_message_interleaving():
         model_name = "SlowMock"
         is_real_llm = True
         details = "Slow mock for concurrency tests"
+        n_ctx = 16384
+        max_tokens = 2048
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split()) if text else 0
 
         def generate_stream(self, messages):
             time.sleep(0.01)

@@ -39,6 +39,13 @@ class MockOfflineLLM:
     model_name: str = "MockOfflineModel"
     is_real_llm: bool = False
     details: str = "In-Memory Test Double"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def generate(self, messages: List[Dict[str, str]]) -> str:
         return "Mock-Offline-Reflexionsantwort."

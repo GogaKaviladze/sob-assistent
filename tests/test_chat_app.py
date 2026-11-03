@@ -90,6 +90,13 @@ class MockLLM(LLMProvider):
     model_name: str = "Mock-Qwen"
     is_real_llm: bool = True
     details: str = "Mock für Tests"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def __init__(self, reply: str = "Fachlicher Reflexionsimpuls"):
         self.reply = reply

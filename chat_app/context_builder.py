@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from chat_app.budget import split_sentences
 
 from chat_app.csv_loader import (
     _format_generic_row,
@@ -87,6 +89,16 @@ def classify_entry_sections(entry_text: str) -> Set[str]:
 
 
 @dataclass(frozen=True)
+class DokuEntryItem:
+    """Einzelner formatierter Doku-Eintrag für deterministische Budgetierung."""
+
+    datum: str
+    formatted_text: str
+    is_assigned: bool
+    sort_key: Any = None
+
+
+@dataclass(frozen=True)
 class BuiltContext:
     """Ergebnis des deterministischen Kontextaufbaus für einen Lebensbereich."""
 
@@ -99,6 +111,9 @@ class BuiltContext:
     total_count: int
     bereich_id: str
     bereich_title: str
+    vorbericht_mandatory: str = ""
+    vorbericht_sentences: List[str] = field(default_factory=list)
+    doku_entries: List[DokuEntryItem] = field(default_factory=list)
 
 
 class ContextBuilder:
@@ -144,7 +159,10 @@ class ContextBuilder:
         fall_kopf_text = "\n".join(fall_kopf_lines)
 
         # 2. Vorbericht nur dieses Bereichs
-        vorbericht_lines = []
+        vorbericht_mandatory_lines: List[str] = []
+        vorbericht_freitext_sentences: List[str] = []
+        vorbericht_lines: List[str] = []
+
         if case.plan and getattr(case.plan, "goals", None):
             matching_goals = [
                 g for g in case.plan.goals
@@ -153,18 +171,37 @@ class ContextBuilder:
             if matching_goals:
                 g = matching_goals[0]
                 if getattr(g, "leitziel", ""):
-                    vorbericht_lines.append(f"• Leitziel: {sanitize_for_prompt(g.leitziel)}")
+                    lz_line = f"• Leitziel: {sanitize_for_prompt(g.leitziel)}"
+                    vorbericht_mandatory_lines.append(lz_line)
+                    vorbericht_lines.append(lz_line)
                 if getattr(g, "smarte_ziele", ""):
-                    vorbericht_lines.append(f"• Smartes Ziel: {sanitize_for_prompt(g.smarte_ziele)}")
-                if getattr(g, "stand_zielerreichung", ""):
-                    vorbericht_lines.append(f"• Bisherige Zielerreichung / Reflexion: {sanitize_for_prompt(g.stand_zielerreichung)}")
-                if getattr(g, "vorschlag_ziele", ""):
-                    vorbericht_lines.append(f"• Vorschlag für aktuelle Ziele: {sanitize_for_prompt(g.vorschlag_ziele)}")
-                if getattr(g, "vorschlag_massnahmen", ""):
-                    vorbericht_lines.append(f"• Vorschlag Maßnahmen: {sanitize_for_prompt(g.vorschlag_massnahmen)}")
-                if getattr(g, "realisierung_andere", ""):
-                    vorbericht_lines.append(f"• Realisierung durch andere: {sanitize_for_prompt(g.realisierung_andere)}")
+                    smart_line = f"• Smartes Ziel: {sanitize_for_prompt(g.smarte_ziele)}"
+                    vorbericht_mandatory_lines.append(smart_line)
+                    vorbericht_lines.append(smart_line)
 
+                # Freitext-Felder
+                freitexte = [
+                    ("Bisherige Zielerreichung / Reflexion", getattr(g, "stand_zielerreichung", "")),
+                    ("Vorschlag für aktuelle Ziele", getattr(g, "vorschlag_ziele", "")),
+                    ("Vorschlag Maßnahmen", getattr(g, "vorschlag_massnahmen", "")),
+                    ("Realisierung durch andere", getattr(g, "realisierung_andere", "")),
+                ]
+                for label, val in freitexte:
+                    if val and val.strip():
+                        sents = split_sentences(val)
+                        if sents:
+                            vorbericht_freitext_sentences.append(f"• {label}: {sanitize_for_prompt(sents[0])}")
+                            for rem_s in sents[1:]:
+                                vorbericht_freitext_sentences.append(sanitize_for_prompt(rem_s))
+                        vorbericht_lines.append(f"• {label}: {sanitize_for_prompt(val)}")
+
+        elif getattr(case, "plan_context", None):
+            # Unstrukturierter Vorbericht-Fallback
+            sents = split_sentences(case.plan_context)
+            vorbericht_freitext_sentences.extend(sents)
+            vorbericht_lines.append(case.plan_context.strip())
+
+        vorbericht_mandatory_text = "\n".join(vorbericht_mandatory_lines)
         if not vorbericht_lines:
             vorbericht_text = "Keine Vorbericht-Ziele für diesen Lebensbereich erfasst."
         else:
@@ -175,6 +212,7 @@ class ContextBuilder:
         unassigned_count = 0
         total_count = 0
         selected_lines: List[str] = []
+        doku_items: List[DokuEntryItem] = []
 
         # Relevante Hamburg-IDs für die Zuordnung
         target_hamburg_ids: Set[str] = set()
@@ -203,12 +241,30 @@ class ContextBuilder:
                     assigned_count += 1
                     formatted = _format_vivendi_entry(e)
                     if formatted:
-                        selected_lines.append(sanitize_for_prompt(formatted))
+                        clean_fmt = sanitize_for_prompt(formatted)
+                        selected_lines.append(clean_fmt)
+                        doku_items.append(
+                            DokuEntryItem(
+                                datum=e.datum,
+                                formatted_text=clean_fmt,
+                                is_assigned=True,
+                                sort_key=_parse_entry_datetime(e.datum, getattr(e, "uhrzeit", "")),
+                            )
+                        )
                 elif is_unassigned:
                     unassigned_count += 1
                     formatted = _format_vivendi_entry(e)
                     if formatted:
-                        selected_lines.append(sanitize_for_prompt(formatted))
+                        clean_fmt = sanitize_for_prompt(formatted)
+                        selected_lines.append(clean_fmt)
+                        doku_items.append(
+                            DokuEntryItem(
+                                datum=e.datum,
+                                formatted_text=clean_fmt,
+                                is_assigned=False,
+                                sort_key=_parse_entry_datetime(e.datum, getattr(e, "uhrzeit", "")),
+                            )
+                        )
 
         elif case.csv and getattr(case.csv, "rows", None) and case.csv.rows:
             rows = case.csv.rows
@@ -221,16 +277,35 @@ class ContextBuilder:
                 is_unassigned = len(matched_sec_ids) == 0
                 is_assigned = bool(matched_sec_ids & target_hamburg_ids)
 
+                date_val = r[0] if r else ""
                 if is_assigned:
                     assigned_count += 1
                     formatted = _format_generic_row(idx, r, headers)
                     if formatted:
-                        selected_lines.append(sanitize_for_prompt(formatted))
+                        clean_fmt = sanitize_for_prompt(formatted)
+                        selected_lines.append(clean_fmt)
+                        doku_items.append(
+                            DokuEntryItem(
+                                datum=date_val,
+                                formatted_text=clean_fmt,
+                                is_assigned=True,
+                                sort_key=idx,
+                            )
+                        )
                 elif is_unassigned:
                     unassigned_count += 1
                     formatted = _format_generic_row(idx, r, headers)
                     if formatted:
-                        selected_lines.append(sanitize_for_prompt(formatted))
+                        clean_fmt = sanitize_for_prompt(formatted)
+                        selected_lines.append(clean_fmt)
+                        doku_items.append(
+                            DokuEntryItem(
+                                datum=date_val,
+                                formatted_text=clean_fmt,
+                                is_assigned=False,
+                                sort_key=idx,
+                            )
+                        )
 
         if not selected_lines:
             verlauf_text = "Keine Verlaufsdokumentation für diesen Bereich vorhanden."
@@ -253,4 +328,7 @@ class ContextBuilder:
             total_count=total_count,
             bereich_id=bereich_id,
             bereich_title=bereich_title,
+            vorbericht_mandatory=vorbericht_mandatory_text,
+            vorbericht_sentences=vorbericht_freitext_sentences,
+            doku_entries=doku_items,
         )

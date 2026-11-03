@@ -51,6 +51,13 @@ class DummyMockLLM(LLMProvider):
     model_name: str = "MockLLM"
     is_real_llm: bool = False
     details: str = "Test Mock"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def generate(self, messages):
         return "Test Antwort"

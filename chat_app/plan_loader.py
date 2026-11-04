@@ -89,6 +89,8 @@ class PlanData:
     client_name_from_filename: bool = False
     is_fallback: bool = False
     hidden_removed: int = 0
+    warning: str = ""
+    parser_source: str = ""
     template: str = ""
 
     @property
@@ -308,20 +310,25 @@ def parse_plan_docx(
                 result_from_fn = bool(getattr(plan_result, "client_name_from_filename", False))
                 client_name = doc_client_name or extract_client_name_from_filename(filename)
                 from_fn = bool(client_name) and (not doc_client_name or result_from_fn)
-                is_fb = bool(getattr(plan_result, "is_fallback", False))
                 raw_summary = getattr(plan_result, "developments", "") or getattr(plan_result, "raw_summary", "")
+
+                is_fallback = getattr(plan_result, "is_fallback", False)
+                warning = getattr(plan_result, "warning", "")
+                parser_source = getattr(plan_result, "parser_source", "bookmarks")
 
                 if mapped_goals:
                     return PlanData(
                         filename=filename,
                         client_name=client_name,
                         client_name_from_filename=from_fn,
-                        is_fallback=is_fb,
                         zeitraum_von=zeitraum_von,
                         zeitraum_bis=zeitraum_bis,
                         goals=mapped_goals,
                         raw_summary=raw_summary,
                         hidden_removed=hidden_removed,
+                        is_fallback=is_fallback,
+                        warning=warning,
+                        parser_source=parser_source,
                         template="op-de-wisch" if is_odw else "hamburg",
                     )
             elif hasattr(plan_result, "goals"):
@@ -358,6 +365,9 @@ def parse_plan_docx(
                     goals=mapped_goals,
                     raw_summary=getattr(plan_result, "raw_summary", "") or getattr(plan_result, "developments", ""),
                     hidden_removed=hidden_removed,
+                    is_fallback=getattr(plan_result, "is_fallback", False),
+                    warning=getattr(plan_result, "warning", ""),
+                    parser_source=getattr(plan_result, "parser_source", "fallback"),
                     template="op-de-wisch" if is_odw else "hamburg",
                 )
     except IncompletePlanError:
@@ -373,6 +383,9 @@ def parse_plan_docx(
     zeitraum_von = ""
     zeitraum_bis = ""
     extracted_goals: List[PlanGoalItem] = []
+    is_fallback = False
+    warning = ""
+    parser_source = "bookmarks"
 
     try:
         if hasattr(target_source, "seek"):
@@ -456,6 +469,12 @@ def parse_plan_docx(
 
             # Falls immer noch keine Ziele via Bookmarks: Paragraphen & Tabellen analysieren
             if not extracted_goals:
+                is_fallback = True
+                parser_source = "text_fallback"
+                warning = (
+                    "⚠️ Vorbericht wurde über Text-Heuristik (Fallback) eingelesen. "
+                    "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
+                )
                 # Tabellen scannen
                 for table in doc.tables:
                     for row in table.rows:
@@ -512,10 +531,153 @@ def parse_plan_docx(
         filename=filename,
         client_name=client_name,
         client_name_from_filename=client_name_from_filename,
-        is_fallback=True,
         zeitraum_von=zeitraum_von,
         zeitraum_bis=zeitraum_bis,
         goals=extracted_goals,
         hidden_removed=hidden_removed,
+        is_fallback=is_fallback,
+        warning=warning,
+        parser_source=parser_source,
         template="op-de-wisch" if is_odw else "hamburg",
     )
+
+
+def parse_plan_text(text: str, filename: str = "vorbericht.txt") -> PlanData:
+    """Liest einen Freitext- oder Markdown-Vorbericht (.txt, .md, POST /api/plan) ein und extrahiert Ziele/Lebensbereiche."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    client_name = ""
+    zeitraum_von = ""
+    zeitraum_bis = ""
+    extracted_goals: List[PlanGoalItem] = []
+
+    hamburg_title_map = {d.id: d.title for d in SECTION_DEFINITIONS}
+    odw_title_map = {d.id: d.title for d in OP_DE_WISCH_SECTION_DEFINITIONS}
+    section_title_map = {**odw_title_map, **hamburg_title_map}
+    valid_section_ids = set(section_title_map.keys())
+
+    heading_re = re.compile(
+        r"^((?:#{1,4}\s*)?(?:(?:Lebens)?Bereich\s+|Abschnitt\s+)?|#{1,4}\s+)(\d+(?:\.\d+)?)\b([:\.\s–\-]*)(.*)$",
+        re.IGNORECASE,
+    )
+    kw_re = re.compile(
+        r"(?i)^(?:[#*\-•]+\s*)?(?:(?:alte|bisherige|aktuelle|neue|vereinbarte)\s+)?(leitziel(?:e)?|teilziel(?:e)?|smart(?:e\s+ziele)?|ziel(?:vereinbarung|erreichung|e)?(?:\s*\d+)?|stand(?:\s+der\s+zielerreichung)?|maßnahmen|massnahmen)\b\s*[:\-]\s*(.+)"
+    )
+
+    curr_sec_id = ""
+    curr_sec_title = ""
+
+    def _append_goal_field(sec_id: str, sec_title: str, kw_type: str, val: str) -> None:
+        existing = next((g for g in extracted_goals if g.section_id == sec_id), None)
+        if existing is None:
+            existing = PlanGoalItem(section_id=sec_id, section_title=sec_title, applies=True)
+            extracted_goals.append(existing)
+        if "smart" in kw_type or "teilziel" in kw_type:
+            existing.smarte_ziele = f"{existing.smarte_ziele}\n{val}".strip() if existing.smarte_ziele else val
+        elif "stand" in kw_type or "erreichung" in kw_type:
+            existing.stand_zielerreichung = f"{existing.stand_zielerreichung}\n{val}".strip() if existing.stand_zielerreichung else val
+        elif "maßnahme" in kw_type or "massnahme" in kw_type:
+            existing.vorschlag_massnahmen = f"{existing.vorschlag_massnahmen}\n{val}".strip() if existing.vorschlag_massnahmen else val
+        else:
+            existing.leitziel = f"{existing.leitziel}\n{val}".strip() if existing.leitziel else val
+
+    for line in lines:
+        if not client_name:
+            m_cl = re.search(r"(?i)^(?:Klient(?:in|\*in)?|Name|Betreute Person)\s*:\s*(.+)$", line)
+            if m_cl:
+                client_name = m_cl.group(1).strip()
+                continue
+
+        m_zr = re.search(r"(\d{2}\.\d{2}\.\d{4})\s*(?:bis|-)\s*(\d{2}\.\d{2}\.\d{4})", line, re.IGNORECASE)
+        if m_zr and not (zeitraum_von or zeitraum_bis):
+            zeitraum_von, zeitraum_bis = m_zr.group(1), m_zr.group(2)
+
+        m_h = heading_re.match(line)
+        if m_h and not kw_re.match(line):
+            prefix = (m_h.group(1) or "").strip()
+            cand_id = m_h.group(2)
+            sep = m_h.group(3) or ""
+            rest = m_h.group(4).strip(" :–-")
+
+            if cand_id in valid_section_ids:
+                # Einstellige IDs (Op-de-Wisch 1..9) nur akzeptieren, wenn explizites Präfix (#, Bereich, Abschnitt)
+                # oder kanonischer Bereichstitel vorliegt (verhindert '2 Termine wahrgenommen' als Bereich 2).
+                is_valid_heading = False
+                if "." in cand_id or prefix:
+                    is_valid_heading = True
+                elif cand_id in odw_title_map and rest:
+                    canon_low = odw_title_map[cand_id].lower()
+                    rest_low = rest.lower()
+                    if (":" in sep or "." in sep) and (rest_low in canon_low or canon_low in rest_low):
+                        is_valid_heading = True
+
+                if is_valid_heading:
+                    curr_sec_id = cand_id
+                    inline_kw = kw_re.match(rest) if rest else None
+                    if inline_kw:
+                        curr_sec_title = section_title_map.get(cand_id, f"Bereich {cand_id}")
+                        _append_goal_field(
+                            curr_sec_id,
+                            curr_sec_title,
+                            inline_kw.group(1).lower(),
+                            inline_kw.group(2).strip() or rest,
+                        )
+                    else:
+                        curr_sec_title = rest or section_title_map.get(cand_id, f"Bereich {cand_id}")
+                    continue
+            else:
+                # Ungültige Bereichs-ID (z. B. 9.9) setzt aktuellen Bereich zurück
+                if prefix or "." in cand_id:
+                    curr_sec_id = ""
+                    curr_sec_title = ""
+                    continue
+
+        m_kw = kw_re.search(line)
+        if m_kw:
+            # Kein stiller Fallback auf '1.1': ohne erkannte Bereichsüberschrift nicht zuordnen
+            if not curr_sec_id:
+                continue
+            kw_type = m_kw.group(1).lower()
+            val = m_kw.group(2).strip() or line
+            sec_title = curr_sec_title or section_title_map.get(curr_sec_id, f"Bereich {curr_sec_id}")
+            _append_goal_field(curr_sec_id, sec_title, kw_type, val)
+        elif curr_sec_id:
+            existing = next((g for g in extracted_goals if g.section_id == curr_sec_id), None)
+            if existing is None:
+                existing = PlanGoalItem(section_id=curr_sec_id, section_title=curr_sec_title, leitziel=line, applies=True)
+                extracted_goals.append(existing)
+            else:
+                existing.leitziel = f"{existing.leitziel}\n{line}".strip() if existing.leitziel else line
+
+    client_name_from_filename = False
+    if not client_name:
+        client_name = extract_client_name_from_filename(filename)
+        client_name_from_filename = bool(client_name)
+
+    warning = (
+        "⚠️ Vorbericht wurde über Text-Heuristik (Fallback) eingelesen. "
+        "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
+    )
+
+    odw_ids = {str(i) for i in range(1, 10)}
+    is_odw = bool(
+        any(g.section_id in odw_ids for g in extracted_goals)
+        or "op_de_wisch" in filename.lower()
+        or "op-de-wisch" in filename.lower()
+        or "fo_svb" in filename.lower()
+    )
+    template = "op-de-wisch" if is_odw else "hamburg"
+
+    return PlanData(
+        filename=filename,
+        client_name=client_name,
+        client_name_from_filename=client_name_from_filename,
+        zeitraum_von=zeitraum_von,
+        zeitraum_bis=zeitraum_bis,
+        goals=extracted_goals,
+        raw_summary=(text or "").strip(),
+        is_fallback=True,
+        warning=warning,
+        parser_source="text_plan",
+        template=template,
+    )
+

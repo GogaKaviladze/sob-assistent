@@ -1300,11 +1300,12 @@ def test_unexpected_csv_header_error_is_not_swallowed(test_bot, monkeypatch):
     """Unerwartete Fehler werden nicht verschluckt, sondern propagieren (-> generischer 500er)."""
     import sob_generator.importer as importer_module
 
+    test_bot.set_csv(parse_csv_content(_vivendi_csv("Øberg, Łukasz (*01.02.1980)"), filename="kaputt.csv"))
+
     def broken(*_a, **_k):
         raise RuntimeError("unerwartet")
 
     monkeypatch.setattr(importer_module, "parse_vivendi_text", broken)
-    test_bot.set_csv(parse_csv_content(_vivendi_csv("Øberg, Łukasz (*01.02.1980)"), filename="kaputt.csv"))
     test_bot.messages = [
         {"role": "user", "content": "Bericht"},
         {"role": "assistant", "content": "### Bereich 1.2\n- Bad gereinigt"},
@@ -1318,11 +1319,12 @@ def test_unreadable_csv_header_reports_manual_field_instead_of_silent_pass(test_
     """Kopfdaten nicht parsebar: kein stilles `except: pass`, sondern ❌-Hinweis ohne Rohzeile."""
     import sob_generator.importer as importer_module
 
+    test_bot.set_csv(parse_csv_content(_vivendi_csv("Øberg, Łukasz (*01.02.1980)"), filename="kaputt.csv"))
+
     def broken(*_a, **_k):
         raise exc("Klientenzeile 'Øberg, Łukasz (*01.02.1980)' nicht parsebar")
 
     monkeypatch.setattr(importer_module, "parse_vivendi_text", broken)
-    test_bot.set_csv(parse_csv_content(_vivendi_csv("Øberg, Łukasz (*01.02.1980)"), filename="kaputt.csv"))
     test_bot.messages = [
         {"role": "user", "content": "Bericht"},
         {"role": "assistant", "content": "### Bereich 1.2\n- Bad gereinigt"},

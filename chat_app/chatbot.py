@@ -31,6 +31,9 @@ class ModelUnavailableError(RuntimeError):
     """Wird ausgelöst, wenn kein Modell geladen werden kann und kein Heuristik-Fallback erlaubt ist."""
     pass
 
+
+ODW_IDS = {str(i) for i in range(1, 10)}
+
 SYSTEM_PROMPT_TEMPLATE = """Du bist ein reflektierender fachlicher Dialogpartner für Fachkräfte in der Sozialen Arbeit.
 
 Deine Rolle und Haltung:
@@ -803,8 +806,10 @@ class ReflectionChatbot:
                 }
                 if plan.template:
                     self.case.template = plan.template
-                elif any(getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"} for g in plan.goals):
+                elif any(getattr(g, "section_id", "") in ODW_IDS for g in plan.goals):
                     self.case.template = "op-de-wisch"
+                elif plan.goals:
+                    self.case.template = "hamburg"
             elif hasattr(plan, "to_compact_context"):
                 self.case.plan = plan
                 self.case.plan_context = plan.to_compact_context()
@@ -813,8 +818,10 @@ class ReflectionChatbot:
                     "zeitraum": getattr(plan, "zeitraum", ""),
                 }
                 sections_dict = getattr(plan, "sections", {})
-                if any(k in {"1", "2", "4", "5", "6", "7", "8", "9"} for k in sections_dict):
+                if any(k in ODW_IDS for k in sections_dict):
                     self.case.template = "op-de-wisch"
+                elif sections_dict:
+                    self.case.template = "hamburg"
             elif isinstance(plan, str):
                 self.case.plan_context = plan.strip() if plan else None
                 self.case.plan = None

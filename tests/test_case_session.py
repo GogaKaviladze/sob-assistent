@@ -178,7 +178,7 @@ def test_complementary_upload_no_confirmation_needed():
     assert res_csv.status_code == 200
 
     # Ergänzender Plan-Upload (.txt)
-    plan_content = "Gesamtplan für denselben Fall"
+    plan_content = "Bereich 1.1 Wohnen\nLeitziel: Gesamtplan für denselben Fall"
     res_plan = client.post(
         "/api/upload-plan",
         files={"file": ("vorbericht.txt", plan_content.encode("utf-8"), "text/plain")},

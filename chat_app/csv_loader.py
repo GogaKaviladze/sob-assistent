@@ -10,7 +10,7 @@ import csv
 import io
 import re
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 from sob_generator.llm.schemas import DocumentationEntry
 
@@ -109,6 +109,48 @@ def _format_generic_row(idx: int, row: List[str], headers: List[str]) -> str:
     return f"[{idx}] " + " | ".join(non_empty) if non_empty else ""
 
 
+def _select_newest_within_budget(
+    pairs: List[Tuple[Any, str]],
+    total: int,
+    max_rows: int,
+    max_chars: int,
+) -> Tuple[int, str]:
+    """Wählt die neuesten k Einträge aus pairs, die inkl. Kürzungshinweis in max_chars und max_rows passen."""
+    eff_max_rows = min(max_rows, len(pairs)) if max_rows else len(pairs)
+    chosen_k = 0
+    chosen_notice = ""
+
+    sub_lens = [len(p[1]) for p in pairs]
+    all_len = sum(sub_lens[-eff_max_rows:]) + (eff_max_rows - 1)
+    if eff_max_rows == total and all_len <= max_chars:
+        chosen_k = total
+        chosen_notice = ""
+    else:
+        start_k = eff_max_rows if eff_max_rows < total else total - 1
+        running_len = sum(sub_lens[-start_k:]) if start_k > 0 else 0
+        for k in range(start_k, 0, -1):
+            skipped = total - k
+            notice = f"... [{skipped} ältere Einträge wegen Limit übersprungen; zeigt die neuesten {k} Einträge] ..."
+            cand_len = len(notice) + 1 + running_len + (k - 1)
+            if cand_len <= max_chars:
+                chosen_k = k
+                chosen_notice = notice
+                break
+            running_len -= sub_lens[-k]
+
+        if chosen_k == 0 and eff_max_rows > 0:
+            newest_len = sub_lens[-1]
+            if newest_len <= max_chars:
+                chosen_k = 1
+                short_notice = f"... [{total - 1} ältere übersprungen; zeigt neuesten Eintrag] ..."
+                if len(short_notice) + 1 + newest_len <= max_chars:
+                    chosen_notice = short_notice
+                else:
+                    chosen_notice = ""
+
+    return chosen_k, chosen_notice
+
+
 @dataclass
 class CsvData:
     """Repräsentiert die geparsten Daten einer CSV-Datei."""
@@ -160,37 +202,7 @@ class CsvData:
                     self.oldest_included_date = ""
                 return ""
 
-            eff_max_rows = min(max_rows, len(pairs)) if max_rows else len(pairs)
-            chosen_k = 0
-            chosen_notice = ""
-
-            sub_lens = [len(p[1]) for p in pairs]
-            all_len = sum(sub_lens[-eff_max_rows:]) + (eff_max_rows - 1)
-            if eff_max_rows == total and all_len <= max_chars:
-                chosen_k = total
-                chosen_notice = ""
-            else:
-                start_k = eff_max_rows if eff_max_rows < total else total - 1
-                running_len = sum(sub_lens[-start_k:]) if start_k > 0 else 0
-                for k in range(start_k, 0, -1):
-                    skipped = total - k
-                    notice = f"... [{skipped} ältere Einträge wegen Limit übersprungen; zeigt die neuesten {k} Einträge] ..."
-                    cand_len = len(notice) + 1 + running_len + (k - 1)
-                    if cand_len <= max_chars:
-                        chosen_k = k
-                        chosen_notice = notice
-                        break
-                    running_len -= sub_lens[-k]
-
-                if chosen_k == 0 and eff_max_rows > 0:
-                    newest_len = sub_lens[-1]
-                    if newest_len <= max_chars:
-                        chosen_k = 1
-                        short_notice = f"... [{total - 1} ältere übersprungen; zeigt neuesten Eintrag] ..."
-                        if len(short_notice) + 1 + newest_len <= max_chars:
-                            chosen_notice = short_notice
-                        else:
-                            chosen_notice = ""
+            chosen_k, chosen_notice = _select_newest_within_budget(pairs, total, max_rows, max_chars)
 
             if chosen_k > 0:
                 kept_pairs = pairs[-chosen_k:]
@@ -278,37 +290,7 @@ class CsvData:
                 self.oldest_included_date = ""
             return ""
 
-        eff_max_rows = min(max_rows, len(pairs)) if max_rows else len(pairs)
-        chosen_k = 0
-        chosen_notice = ""
-
-        sub_lens = [len(p[1]) for p in pairs]
-        all_len = sum(sub_lens[-eff_max_rows:]) + (eff_max_rows - 1)
-        if eff_max_rows == total and all_len <= max_chars:
-            chosen_k = total
-            chosen_notice = ""
-        else:
-            start_k = eff_max_rows if eff_max_rows < total else total - 1
-            running_len = sum(sub_lens[-start_k:]) if start_k > 0 else 0
-            for k in range(start_k, 0, -1):
-                skipped = total - k
-                notice = f"... [{skipped} ältere Einträge wegen Limit übersprungen; zeigt die neuesten {k} Einträge] ..."
-                cand_len = len(notice) + 1 + running_len + (k - 1)
-                if cand_len <= max_chars:
-                    chosen_k = k
-                    chosen_notice = notice
-                    break
-                running_len -= sub_lens[-k]
-
-            if chosen_k == 0 and eff_max_rows > 0:
-                newest_len = sub_lens[-1]
-                if newest_len <= max_chars:
-                    chosen_k = 1
-                    short_notice = f"... [{total - 1} ältere übersprungen; zeigt neuesten Eintrag] ..."
-                    if len(short_notice) + 1 + newest_len <= max_chars:
-                        chosen_notice = short_notice
-                    else:
-                        chosen_notice = ""
+        chosen_k, chosen_notice = _select_newest_within_budget(pairs, total, max_rows, max_chars)
 
         def _extract_oldest_date(row: List[str]) -> str:
             if date_col_idx != -1 and date_col_idx < len(row):
@@ -405,55 +387,6 @@ def is_vivendi_csv(content: str) -> bool:
     return required.issubset(set(norm_cells))
 
 
-def _extract_fallback_vivendi_entries(content: str) -> List[DocumentationEntry]:
-    """Extrahiert Vivendi-Einträge im gehärteten Fallback-Modus ohne Zeilen 0-4 und ohne Handzeichen (Spalte 18)."""
-    try:
-        reader = csv.reader(io.StringIO(content), delimiter=";")
-        rows = list(reader)
-    except Exception:
-        return []
-
-    header_idx = -1
-    for idx, r in enumerate(rows[:15]):
-        norm_cells = [c.strip().lower() for c in r if c.strip()]
-        if {"datum", "uhrzeit", "kategorie"}.issubset(set(norm_cells)):
-            header_idx = idx
-            break
-
-    if header_idx == -1 or header_idx + 1 >= len(rows):
-        return []
-
-    entries: List[DocumentationEntry] = []
-    for i in range(header_idx + 1, len(rows), 2):
-        meta_row = rows[i]
-        if i + 1 >= len(rows):
-            if any(cell.strip() for cell in meta_row):
-                raise ValueError(
-                    f"Vivendi-Export unvollständig: Metazeile (Z{i+1}) ohne zugehörige Textzeile am Dateiende."
-                )
-            break
-        text_row = rows[i + 1]
-
-        datum = meta_row[4].strip() if len(meta_row) > 4 else ""
-        uhrzeit = meta_row[6].strip() if len(meta_row) > 6 else ""
-        schicht = meta_row[8].strip() if len(meta_row) > 8 else ""
-        kategorie = meta_row[10].strip() if len(meta_row) > 10 else ""
-        text = text_row[4].strip() if len(text_row) > 4 else ""
-
-        if not datum and not text:
-            continue
-        entries.append(
-            DocumentationEntry(
-                datum=datum,
-                uhrzeit=uhrzeit,
-                schicht=schicht,
-                kategorie=kategorie,
-                text=text,
-            )
-        )
-    return entries
-
-
 def parse_csv_content(content: str, filename: str = "daten.csv", client_name: str = "") -> CsvData:
     """Parst einen CSV-Textstring robust (unterstützt Vivendi-PD und generische Formate)."""
     from_fn = bool(client_name and client_name != "Klient*in (anonymisiert)")
@@ -474,7 +407,7 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
 
     content_clean = content.lstrip("\ufeff")
 
-    # Vivendi-Spezialpfad (RAM-only via Importer)
+    # Vivendi-Spezialpfad (RAM-only via Importer, ohne stillen Fallback)
     if is_vivendi_csv(content_clean):
         from sob_generator.importer import parse_vivendi_text
 
@@ -505,27 +438,9 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
         except Exception as exc:
             if "unvollständig" in str(exc).lower():
                 raise
-            fallback_entries = _extract_fallback_vivendi_entries(content_clean)
-            if not fallback_entries:
-                raise ValueError(
-                    f"Vivendi-Export fehlerhaft und kann nicht verarbeitet werden: {type(exc).__name__}"
-                ) from exc
-
-            csv_data = CsvData(
-                filename=filename,
-                headers=[],
-                rows=[],
-                total_rows=len(fallback_entries),
-                raw_text=content,
-                client_name=client_name,
-                client_name_from_filename=from_fn,
-                entries=fallback_entries,
-                entries_total=len(fallback_entries),
-                entries_in_context=0,
-                oldest_included_date="",
-            )
-            csv_data.to_context_text()
-            return csv_data
+            raise ValueError(
+                f"Vivendi-Export fehlerhaft und kann nicht verarbeitet werden: {type(exc).__name__}"
+            ) from exc
 
     # Generischer CSV-Pfad
     sample_lines = [line for line in content_clean.splitlines() if line.strip()][:10]
@@ -576,6 +491,32 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
         rows = raw_rows[header_idx + 1:]
     else:
         rows = raw_rows
+
+    # Fail-closed: Prüfe auf erkennbare Verlaufsdokumentations-Spalten
+    doku_text_cols = {
+        "notiz", "text", "bericht", "verlauf", "dokumentation", "eintrag",
+        "inhalt", "details", "beschreibung", "beobachtung", "bemerkung", "event",
+    }
+    strong_doku_cols = {"bericht", "verlauf", "dokumentation", "beobachtung"}
+    roster_signals = {
+        "dienstbeginn", "dienstende", "soll", "ist", "pause", "urlaub",
+        "schicht/dienst", "dienst/schicht", "schichtart", "dienstplan", "schichtplan",
+    }
+    norm_headers = {h.strip().lower() for h in headers if h.strip() and not h.startswith("Spalte_")}
+    has_doku_col = any(any(d in h for d in doku_text_cols) for h in norm_headers)
+    has_strong_doku_col = any(any(sd in h for sd in strong_doku_cols) for h in norm_headers)
+    
+    # Dienstplan-/Schichtplan-Erkennung (keine Klientenverläufe)
+    dienstplan_filename = "dienstplan" in filename.lower() or "schichtplan" in filename.lower()
+    has_staff_col = any(any(sc in h for sc in ("mitarbeiter", "personal", "kolleg", "mitarbeitend")) for h in norm_headers)
+    has_shift_col = any(any(sc in h for sc in ("schicht", "dienst")) for h in norm_headers)
+    has_roster_signal = any(any(rs in h for rs in roster_signals) for h in norm_headers)
+    is_dienstplan = dienstplan_filename or (has_staff_col and has_shift_col) or has_roster_signal
+
+    if not norm_headers or not has_doku_col or (is_dienstplan and not has_strong_doku_col):
+        raise ValueError(
+            "❌ Keine Verlaufsdokumentation erkannt: Die CSV-Datei enthält keine erkennbaren Dokumentationsspalten."
+        )
 
     csv_data = CsvData(
         filename=filename,

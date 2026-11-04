@@ -169,7 +169,9 @@ class PreviousPlanData(BaseModel):
     zeitraum: str = ""
     developments: str = ""
     sections: Dict[str, PlanSectionGoal] = Field(default_factory=dict)
+    parser_source: str = "bookmarks"
     is_fallback: bool = False
+    warning: str = ""
     client_name_from_filename: bool = False
 
     def to_compact_context(self, max_tokens: int = 500) -> str:
@@ -321,6 +323,8 @@ class UniversalPlanImporter:
             source.seek(0)
         plan = self._extract_bookmarks(source, filename=fn)
         if plan is not None and plan.sections:
+            plan.parser_source = "bookmarks"
+            plan.is_fallback = False
             return plan
 
         # 2. Versuche Fastpath für Op-de-Wisch-Vorlage (SDT + 9 Bereichstabellen)
@@ -328,12 +332,21 @@ class UniversalPlanImporter:
             source.seek(0)
         odw_plan = self._extract_op_de_wisch(source, filename=fn)
         if odw_plan is not None and odw_plan.sections:
+            odw_plan.parser_source = "op_de_wisch"
+            odw_plan.is_fallback = False
             return odw_plan
 
         # 3. Fallback: Strukturierte Tabellen- und Text-Heuristik
         if hasattr(source, "seek"):
             source.seek(0)
-        return self._extract_fallback(source, filename=fn)
+        fallback_plan = self._extract_fallback(source, filename=fn)
+        fallback_plan.parser_source = "fallback"
+        fallback_plan.is_fallback = True
+        fallback_plan.warning = (
+            "⚠️ Vorbericht wurde über Heuristik/Fallback eingelesen. "
+            "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
+        )
+        return fallback_plan
 
     def _extract_bookmarks(
         self,

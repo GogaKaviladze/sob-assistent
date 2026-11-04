@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from chat_app.app import create_app
 from chat_app.chatbot import ReflectionChatbot, ReflectionEngine
-from chat_app.csv_loader import CsvData, parse_csv_content
+from chat_app.csv_loader import CsvData, is_vivendi_csv, parse_csv_content
 from sob_generator.importer import parse_vivendi_text
 from sob_generator.llm.schemas import DocumentationEntry
 
@@ -192,18 +192,15 @@ def test_session_endpoint_includes_csv_counters():
 
 
 def test_generic_csv_with_similar_headers_not_misidentified_as_vivendi():
-    """Generische CSV mit ähnlichen Headern (Datum, Uhrzeit, Schicht, Kategorie) darf NICHT als Vivendi eingestuft werden."""
+    """Generische Dienstplan-CSV mit ähnlichen Headern (Datum, Uhrzeit, Schicht, Kategorie) darf NICHT als Vivendi eingestuft werden, wird aber fail-closed als Nicht-Verlaufsdokumentation abgelehnt."""
     generic_csv = (
         "Mitarbeiter;Datum;Uhrzeit;Schicht;Kategorie;Notiz\n"
         "Max;01.01.2025;08:00;Früh;Pflege;Dienstübernahme Dokumentation\n"
         "Erika;02.01.2025;14:00;Spät;Pflege;Begleitung Facharztbesuch\n"
     )
-    csv_data = parse_csv_content(generic_csv, filename="dienstplan.csv")
-    assert len(csv_data.entries) == 0  # Darf keine Vivendi-Entries haben
-    assert csv_data.entries_total == 2
-    ctx = csv_data.to_context_text()
-    assert "Dienstübernahme Dokumentation" in ctx
-    assert "Begleitung Facharztbesuch" in ctx
+    assert is_vivendi_csv(generic_csv) is False
+    with pytest.raises(ValueError, match="❌ Keine Verlaufsdokumentation erkannt"):
+        parse_csv_content(generic_csv, filename="dienstplan.csv")
 
 
 def test_vivendi_with_quoted_headers_detected_correctly():
@@ -312,18 +309,15 @@ def test_strict_max_chars_budgeting_never_exceeds_budget():
 
 
 def test_generic_csv_with_birthdates_in_first_column_not_misidentified_as_vivendi():
-    """Generische CSV mit Klientengeburtsdaten in Spalte 1 darf NICHT als Vivendi eingestuft und blockiert werden."""
+    """Generische Stammdaten-CSV mit Klientengeburtsdaten in Spalte 1 darf NICHT als Vivendi eingestuft werden, wird aber ohne Verlaufsdoku-Spalten fail-closed abgelehnt."""
     csv_content = (
         "Klient;Stadt;Leistung\n"
         "Mustermann, Max (*01.01.1980);Köln;ASP\n"
         "Schmidt, Anna (*15.03.1975);Bonn;ASP\n"
     )
-    csv_data = parse_csv_content(csv_content, filename="klienten.csv")
-    assert len(csv_data.entries) == 0
-    assert csv_data.entries_total == 2
-    ctx = csv_data.to_context_text()
-    assert "Mustermann, Max (*01.01.1980)" in ctx
-    assert "Schmidt, Anna (*15.03.1975)" in ctx
+    assert is_vivendi_csv(csv_content) is False
+    with pytest.raises(ValueError, match="❌ Keine Verlaufsdokumentation erkannt"):
+        parse_csv_content(csv_content, filename="klienten.csv")
 
 
 def test_all_tracked_docx_metadata_no_pii():
@@ -499,6 +493,41 @@ def test_generic_csv_ignores_birthdate_for_sorting_and_oldest_date():
     ctx = csv_data.to_context_text(max_rows=1)
     assert "Neuerer Verlauf" in ctx
     assert "Älterer Verlauf" not in ctx
+
+
+def test_no_fallback_vivendi_function_in_csv_loader():
+    """Punkt 4: Der stille Fallback _extract_fallback_vivendi_entries existiert nicht mehr in csv_loader."""
+    import chat_app.csv_loader as csv_loader_mod
+    assert not hasattr(csv_loader_mod, "_extract_fallback_vivendi_entries")
+
+
+def test_csv_without_documentation_columns_rejected_400():
+    """Punkt 4: CSV ohne erkennbare Verlaufsdoku-Spalten (z.B. dienstplan_generisch.csv oder Klientenliste) -> ValueError / 400 '❌ Keine Verlaufsdokumentation erkannt'."""
+    dienstplan_path = Path(__file__).resolve().parents[1] / "synthetic_test_data" / "04_edge_cases" / "dienstplan_generisch.csv"
+    content = dienstplan_path.read_text(encoding="utf-8")
+
+    # 1. Falls dienstplan_generisch.csv keine Verlaufsdoku-Spalten hat oder eine generische Tabelle ohne Doku-Spalten geladen wird:
+    non_doku_csv = "Mitarbeiter;Schicht;Raum\nMax;Früh;101\nErika;Spät;102\n"
+    with pytest.raises(ValueError, match="❌ Keine Verlaufsdokumentation erkannt"):
+        parse_csv_content(non_doku_csv, filename="dienstplan.csv")
+
+    app = create_app(chatbot=ReflectionChatbot(provider=ReflectionEngine()))
+    client = TestClient(app)
+
+    res_non_doku = client.post(
+        "/api/upload",
+        files={"file": ("dienstplan.csv", non_doku_csv.encode("utf-8"), "text/csv")},
+    )
+    assert res_non_doku.status_code == 400
+    assert "❌ Keine Verlaufsdokumentation erkannt" in res_non_doku.json()["detail"]
+
+    res_edge = client.post(
+        "/api/upload",
+        files={"file": ("dienstplan_generisch.csv", content.encode("utf-8"), "text/csv")},
+    )
+    assert res_edge.status_code == 400
+    assert "❌ Keine Verlaufsdokumentation erkannt" in res_edge.json()["detail"]
+
 
 
 

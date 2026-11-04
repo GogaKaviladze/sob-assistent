@@ -386,6 +386,183 @@ def test_area_confirm_flag_ram_only():
     res_bad = client.post("/api/area/confirm", json={"bereich_id": "99.9"})
     assert res_bad.status_code == 422
 
+def test_area_review_shows_assigned_entries_and_alt_sob():
+    """Prüft Issue #23: 'Bereich prüfen' liefert die zugeordneten CSV-Einträge und den Alt-SOB-Teil."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. Synthetischen 9-Bereich-Plan und CSV hochladen
+    plan_bytes = build_hamburg_vorbericht(fallback=False)
+    client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "vorbericht_synth.docx",
+                io.BytesIO(plan_bytes),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+
+    csv_content = (
+        "Datum;Uhrzeit;Mitarbeiter;Kategorie;Bericht\n"
+        "01.02.2025;10:00;Pflegekraft;Wohnung;Wohnung aufgeräumt und gelüftet.\n"
+        "02.02.2025;11:00;Pflegekraft;Allgemein;Klient wirkte heute gut gelaunt.\n"
+        "03.02.2025;12:00;Pflegekraft;Freizeit;Spaziergang im Park unternommen.\n"
+    )
+    res_csv = client.post(
+        "/api/upload",
+        files={"file": ("Synthetischer_Klient_verlauf.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")},
+    )
+    assert res_csv.status_code == 200
+
+    # 2. Bereich 1.1 wählen
+    client.post("/api/area", json={"bereich_id": "1.1"})
+
+    # 3. GET /api/area/1.1/review aufrufen
+    res = client.get("/api/area/1.1/review")
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["success"] is True
+    assert data["bereich_id"] == "1.1"
+    assert data["bereich_title"] == "Wohnsituation"
+    assert data["confirmed"] is False
+
+    # Alt-SOB Ziele prüfen (aus Fixture 1.1)
+    assert data["alt_sob"]["has_goals"] is True
+    assert data["alt_sob"]["leitziel"] == "ZZ_SYNTH_1_1_LEITZIEL"
+    assert data["alt_sob"]["smarte_ziele"] == "ZZ_SYNTH_1_1_SMARTE_ZIELE"
+    assert data["alt_sob"]["stand_zielerreichung"] == "ZZ_SYNTH_1_1_BERICHT"
+
+    # CSV-Zuordnung prüfen: Wohnung gehört zu 1.1
+    assert data["assigned_count"] == 1
+    assert any("Wohnung aufgeräumt" in e["text"] for e in data["assigned_entries"])
+
+    # Allgemeiner Eintrag ohne spezifische Zuordnung landet in unassigned
+    assert data["unassigned_count"] >= 1
+    assert any("gut gelaunt" in e["text"] for e in data["unassigned_entries"])
+
+    # 4. POST /api/area/review liefert identische Daten
+    res_post = client.post("/api/area/review", json={"bereich_id": "1.1"})
+    assert res_post.status_code == 200
+    assert res_post.json()["assigned_count"] == 1
+
+    # 5. Bestätigen und erneute Prüfung zeigt confirmed=True
+    client.post("/api/area/confirm", json={"bereich_id": "1.1"})
+    res_after = client.get("/api/area/1.1/review")
+    assert res_after.json()["confirmed"] is True
+
+
+# ===========================================================================
+# 6. Issue #23 & PR #24 Review-Befunde: Validierung, Vorbericht-Text, Vorlagen-Check, UI-Fehleranzeige
+# ===========================================================================
+
+@pytest.mark.parametrize("invalid_id", ["99.9", "1.9", "evil_input_ZZ_SYNTH", "ungueltig"])
+def test_get_area_review_invalid_id_returns_422_no_leak(invalid_id, caplog):
+    """Punkt 1: GET /api/area/{bereich_id}/review mit ungültiger ID liefert 422 (nie 500) und loggt keinen Rohwert."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    with caplog.at_level(logging.DEBUG, logger="chat_app"):
+        res = client.get(f"/api/area/{invalid_id}/review")
+
+    assert res.status_code == 422
+    assert "❌" in str(res.json().get("detail", ""))
+    assert invalid_id not in res.text
+    assert invalid_id not in caplog.text
+
+
+def test_area_compatibility_checked_on_review_and_confirm():
+    """Befund 3: Vorlagen-Kompatibilität wird auch in GET /api/area/{id}/review, POST /api/area/review und POST /api/area/confirm geprüft (422 mit ❌)."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. Op-de-Wisch Plan setzen (IDs "1", "2", "4")
+    bot.set_plan(
+        PlanData(
+            filename="odw.docx",
+            goals=[PlanGoalItem(section_id="4", section_title="Wohnen", leitziel="ZZ_SYNTH_ODW_4")],
+        )
+    )
+
+    for endpoint_call in [
+        lambda: client.get("/api/area/1.1/review"),
+        lambda: client.post("/api/area/review", json={"bereich_id": "1.1"}),
+        lambda: client.post("/api/area/confirm", json={"bereich_id": "1.1"}),
+        lambda: client.post("/api/area", json={"bereich_id": "1.1"}),
+    ]:
+        res = endpoint_call()
+        assert res.status_code == 422
+        assert "❌" in res.json()["detail"]
+
+    # Gültige OdW-ID funktioniert
+    assert client.get("/api/area/4/review").status_code == 200
+    assert client.post("/api/area/review", json={"bereich_id": "4"}).status_code == 200
+    assert client.post("/api/area/confirm", json={"bereich_id": "4"}).status_code == 200
+
+    # 2. Hamburger Plan setzen (ID "1.1") -> OdW-ID "4" muss 422 liefern
+    bot.set_plan(
+        PlanData(
+            filename="hh.docx",
+            goals=[PlanGoalItem(section_id="1.1", section_title="Wohnen", leitziel="ZZ_SYNTH_HH_1_1")],
+        )
+    )
+    for endpoint_call in [
+        lambda: client.get("/api/area/4/review"),
+        lambda: client.post("/api/area/review", json={"bereich_id": "4"}),
+        lambda: client.post("/api/area/confirm", json={"bereich_id": "4"}),
+        lambda: client.post("/api/area", json={"bereich_id": "4"}),
+    ]:
+        res = endpoint_call()
+        assert res.status_code == 422
+        assert "❌" in res.json()["detail"]
+
+
+def test_context_builder_includes_accepted_text_plan_in_build_and_review():
+    """Befund 2 & Review-Korrektur 3: Akzeptierter Text-Vorbericht wird in ContextBuilder.build und get_review_data eingebunden; beim Freitext-Fallback für andere Bereiche wird er sichtbar mit '⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:' gekennzeichnet."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    plan_text = "Bereich 1.1 Wohnsituation\nLeitziel: ZZ_SYNTH_TEXT_PLAN_1_1 Eigene Wohnung selbstständig erhalten."
+    res_plan = client.post("/api/plan", json={"plan_text": plan_text, "filename": "vorbericht.txt"})
+    assert res_plan.status_code == 200
+
+    # 1. Bereich 1.1 hat ein direkt zugeordnetes Ziel
+    built_1_1 = ContextBuilder.build(bot.case, "1.1")
+    assert "ZZ_SYNTH_TEXT_PLAN_1_1" in built_1_1.vorbericht_bereich
+
+    # 2. Bereich 1.2 hat kein eigenes Ziel im Text-Vorbericht -> Freitext-Fallback mit sichtbarem ⚠️-Präfix in Prompt & Review
+    built_1_2 = ContextBuilder.build(bot.case, "1.2")
+    assert "⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:" in built_1_2.vorbericht_bereich
+    assert "ZZ_SYNTH_TEXT_PLAN_1_1" in built_1_2.vorbericht_bereich
+
+    res_rev_1_2 = client.get("/api/area/1.2/review")
+    assert res_rev_1_2.status_code == 200
+    rev_data = res_rev_1_2.json()
+    assert rev_data["alt_sob"]["has_goals"] is True
+    assert "⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:" in rev_data["alt_sob"]["text"]
+    assert "⚠️ Freitext-Vorbericht ohne Bereichszuordnung – gesamter Text:" in rev_data["alt_sob"]["leitziel"]
+    assert "ZZ_SYNTH_TEXT_PLAN_1_1" in rev_data["alt_sob"]["text"]
+
+
+def test_ui_upload_error_banner_present_in_index_html():
+    """Punkt 3: templates/index.html zeigt Upload-Fehler (Status >= 400) sichtbar im Upload-Bereich an (CSV und Vorbericht) und hat einen funktionierenden Schließen-Button im Modal."""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parents[1] / "chat_app" / "templates" / "index.html").read_text(encoding="utf-8")
+
+    # Sichtbare Fehlerboxen im Upload-Bereich für CSV und Vorbericht
+    assert 'id="csvUploadError"' in html
+    assert 'id="planUploadError"' in html
+    # Status >= 400 / !res.ok Prüfung in beiden Upload-Handlern
+    assert "res.status >= 400" in html or "!res.ok" in html
+    # Modal nutzt konsistent 'active' statt 'open'
+    assert "modal.classList.add('open')" not in html
+
 
 def test_chat_stream_without_confirmed_area_returns_409_and_does_not_call_llm(caplog):
     """POST /api/chat-stream ohne bestätigten Bereich (wenn Plan geladen) -> 409, kein Modellaufruf."""
@@ -669,4 +846,120 @@ def test_op_de_wisch_area_3_gesundheit_selectable_and_confirmable():
     assert bot.case.is_area_confirmed("3") is True
 
 
+def test_hamburg_plan_after_odw_resets_template():
+    """Wenn ein Hamburger Plan nach einem Op-de-Wisch-Plan geladen wird, setzt bot.set_plan die Vorlage zurück auf hamburg."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
 
+    # 1. Op-de-Wisch-Plan laden
+    odw_plan = PlanData(
+        filename="odw.docx",
+        template="op-de-wisch",
+        goals=[PlanGoalItem(section_id="4", section_title="Wohnen", leitziel="ZZ_SYNTH_ODW_4")],
+    )
+    bot.set_plan(odw_plan)
+    assert bot.case.template == "op-de-wisch"
+
+    # OdW-Bereich "4" ist gültig
+    res_odw = client.post("/api/area", json={"bereich_id": "4"})
+    assert res_odw.status_code == 200
+
+    # 2. Hamburger Plan setzen -> Vorlage muss wieder auf "hamburg" zurückfallen
+    hh_plan = PlanData(
+        filename="hh.docx",
+        goals=[PlanGoalItem(section_id="1.1", section_title="Wohnen", leitziel="ZZ_SYNTH_HH_1_1")],
+    )
+    bot.set_plan(hh_plan)
+    assert bot.case.template == "hamburg"
+
+    # OdW-Bereich "4" wird nun abgelehnt
+    res_bad = client.post("/api/area", json={"bereich_id": "4"})
+    assert res_bad.status_code == 422
+    assert "❌" in res_bad.json()["detail"]
+
+    # Hamburg-Bereich "1.1" ist gültig
+    res_hh = client.post("/api/area", json={"bereich_id": "1.1"})
+    assert res_hh.status_code == 200
+
+
+def test_review_and_budget_coexist():
+    """Review-Ansicht und Token-Budget existieren kooperativ: Review-Daten werden geliefert, context_status ist in /api/session verfügbar und Freitext-Plan durchläuft das Budget."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # Plan und CSV hochladen
+    plan_text = "Bereich 1.1 Wohnen\nLeitziel: Selbstständiges Wohnen erhalten."
+    res_plan = client.post("/api/plan", json={"plan_text": plan_text, "filename": "plan.txt"})
+    assert res_plan.status_code == 200
+
+    csv_text = "Datum;Kategorie;Text\n01.05.2025;Wohnen;Reguläre Verlaufsnotiz"
+    res_csv = client.post(
+        "/api/upload",
+        files={"file": ("verlauf.csv", csv_text.encode("utf-8"), "text/csv")},
+    )
+    assert res_csv.status_code == 200
+
+    # Bereich wählen
+    res_area = client.post("/api/area", json={"bereich_id": "1.1"})
+    assert res_area.status_code == 200
+
+    # 1. Review-Endpunkt liefert 200 mit Review-Daten
+    res_rev = client.get("/api/area/1.1/review")
+    assert res_rev.status_code == 200
+    rev_data = res_rev.json()
+    assert rev_data["bereich_id"] == "1.1"
+    assert rev_data["alt_sob"]["has_goals"] is True
+
+    # 2. Session enthält context_status vom Token-Budget
+    res_session = client.get("/api/session")
+    assert res_session.status_code == 200
+    sess_data = res_session.json()
+    assert "context_status" in sess_data
+    assert sess_data["context_status"] is not None
+
+    # 3. Freitext-Vorbericht für Bereich ohne explizite Ziele läuft durch das Budget
+    rev_1_2 = client.get("/api/area/1.2/review")
+    assert rev_1_2.status_code == 200
+    rev_1_2_data = rev_1_2.json()
+    assert "⚠️ Freitext-Vorbericht ohne Bereichszuordnung" in rev_1_2_data["alt_sob"]["text"]
+
+
+def test_ui_error_handling_and_functions_present():
+    """Statische Prüfung von index.html: formatErrorDetail existiert, Upload-Handler rufen appendErrorMessage auf, keine doppelt definierten Funktionen."""
+    from pathlib import Path
+    import re
+    html = (Path(__file__).resolve().parents[1] / "chat_app" / "templates" / "index.html").read_text(encoding="utf-8")
+
+    # 1. Zentrale Fehlerformatierung
+    assert "function formatErrorDetail(" in html
+
+    # 2. Upload-Handler rufen appendErrorMessage für rote Chatmeldungen auf
+    assert "appendErrorMessage" in html
+    # handleFileSelected (CSV)
+    hfs_idx = html.find("async function handleFileSelected(")
+    assert hfs_idx != -1
+    hfs_end = html.find("function handleDragOver", hfs_idx)
+    hfs_block = html[hfs_idx:hfs_end]
+    assert "appendErrorMessage(" in hfs_block
+
+    # handlePlanFileSelected (Plan)
+    hpfs_idx = html.find("async function handlePlanFileSelected(")
+    assert hpfs_idx != -1
+    hpfs_end = html.find("async function handleFileSelected(", hpfs_idx)
+    hpfs_block = html[hpfs_idx:hpfs_end]
+    assert "appendErrorMessage(" in hpfs_block
+
+    # 3. Keine doppelten Funktionsdeklarationen
+    func_pattern = re.compile(r"function\s+([A-Za-z0-9_]+)\s*\(")
+    matches = func_pattern.findall(html)
+    duplicates = [fn for fn in set(matches) if matches.count(fn) > 1]
+    assert duplicates == [], f"Doppelt definierte JS-Funktionen: {duplicates}"
+
+    # Wichtige Funktionen je genau einmal vorhanden
+    assert matches.count("updateBudgetUI") == 1
+    assert matches.count("openAreaReviewModal") == 1
+    assert matches.count("closeAreaReviewModal") == 1
+    assert matches.count("toggleReviewUnassigned") == 1
+    assert matches.count("confirmFromReviewModal") == 1

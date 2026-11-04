@@ -1054,6 +1054,7 @@
           <p><strong>CSV hier ablegen</strong><br>oder zum Hochladen klicken</p>
           <input type="file" id="csvFileInput" accept=".csv" onchange="handleFileSelected(this.files)">
         </div>
+        <div id="csvUploadError" role="alert" style="display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-size: 0.8rem; line-height: 1.4;"></div>
       </div>
 
       <div class="csv-card" id="csvCard">
@@ -1089,6 +1090,7 @@
           <p><strong>DOCX-Vorbericht hier ablegen</strong><br>oder zum Hochladen klicken</p>
           <input type="file" id="planFileInput" accept=".docx" onchange="handlePlanFileSelected(this.files)">
         </div>
+        <div id="planUploadError" role="alert" style="display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-size: 0.8rem; line-height: 1.4;"></div>
       </div>
 
       <div class="plan-card" id="planCard">
@@ -1105,6 +1107,7 @@
         </button>
         <div class="plan-meta" id="planCardMeta">0 Bereiche erkannt</div>
         <div id="planHiddenWarning" style="color: #f59e0b; font-size: 0.8rem; margin-top: 4px; display: none;"></div>
+        <div id="planParserWarning" style="color: #f59e0b; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 6px; padding: 6px 8px; font-size: 0.78rem; margin-top: 6px; display: none; line-height: 1.35;"></div>
         <div class="plan-accordion-content" id="planAccordionContent" role="region" aria-labelledby="planAccordionButton">
           <div class="plan-detail-row" id="planClientRow"><strong>Klient:</strong> <span id="planClientName">-</span></div>
           <div class="plan-detail-row" id="planPeriodRow"><strong>Zeitraum:</strong> <span id="planPeriod">-</span></div>
@@ -1143,9 +1146,9 @@
           type="button"
           class="btn btn-outline"
           id="confirmAreaBtn"
-          onclick="confirmCurrentArea()"
+          onclick="openAreaReviewModal()"
           style="display: none; padding: 4px 12px; font-size: 0.8rem;"
-          title="Bestätigt den Lebensbereich als fachlich geprüft (Legal 1)"
+          title="Prüft die dem Bereich zugeordneten Einträge und den Alt-SOB-Teil"
         >
           Bereich prüfen
         </button>
@@ -1265,6 +1268,64 @@
     </div>
   </div>
 
+  <!-- Bereich prüfen Modal (Issue #23) -->
+  <div id="areaReviewModal" class="modal-overlay" onclick="if(event.target===this) closeAreaReviewModal()">
+    <div class="modal-card" style="max-width: 860px; max-height: 85vh;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <h3 style="margin: 0;">🔍 Bereich prüfen: <span id="reviewAreaTitle">-</span></h3>
+          <span id="reviewConfirmedBadge" class="area-doku-badge" style="display: none; background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3);">Geprüft ✓</span>
+        </div>
+        <button class="btn btn-outline" onclick="closeAreaReviewModal()">✕ Schließen</button>
+      </div>
+      <div class="modal-body" style="gap: 16px;">
+        <!-- Alt-SOB / Vorbericht Karte -->
+        <div style="background: #0f172a; border: 1px solid var(--card-border); border-radius: 8px; padding: 14px;">
+          <div style="font-weight: 600; color: #38bdf8; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
+            <span>📋</span> Alt-SOB / Vorbericht: Bisherige Ziele & Reflexion
+          </div>
+          <div id="reviewAltSobContent" style="color: #cbd5e1; font-size: 0.85rem; line-height: 1.5; white-space: pre-wrap;">
+            Lade Vorbericht-Ziele…
+          </div>
+        </div>
+
+        <!-- Zugeordnete CSV-Einträge Karte -->
+        <div style="background: #0f172a; border: 1px solid var(--card-border); border-radius: 8px; padding: 14px;">
+          <div style="font-weight: 600; color: #4ade80; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span>📄</span> Dem Bereich zugeordnete Dokumentation (<span id="reviewAssignedCount">0</span> Einträge)
+            </div>
+            <span style="font-size: 0.75rem; color: #94a3b8;">Schlüsselwort-Zuordnung</span>
+          </div>
+          <div id="reviewAssignedEntries" style="max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+            Keine zugeordneten Einträge.
+          </div>
+        </div>
+
+        <!-- Nicht zugeordnete Einträge (Allgemeinkontext) -->
+        <div style="background: #0b1120; border: 1px solid #1e293b; border-radius: 8px; padding: 10px 14px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="toggleReviewUnassigned()">
+            <div style="font-size: 0.8rem; color: #94a3b8; display: flex; align-items: center; gap: 6px;">
+              <span>ℹ️</span> <span id="reviewUnassignedSummary">+ 0 nicht zugeordnete Einträge (Allgemeinkontext)</span>
+            </div>
+            <span id="reviewUnassignedToggle" style="font-size: 0.75rem; color: #64748b;">Anzeigen ▼</span>
+          </div>
+          <div id="reviewUnassignedEntries" style="display: none; max-height: 180px; overflow-y: auto; margin-top: 10px; flex-direction: column; gap: 6px;">
+          </div>
+        </div>
+      </div>
+      <div style="padding: 14px 20px; border-top: 1px solid var(--card-border); display: flex; justify-content: space-between; align-items: center; background: #0b1120;">
+        <span style="font-size: 0.78rem; color: #64748b;">🔒 RAM-only: Einträge und Vorbericht bleiben flüchtig im Speicher.</span>
+        <div style="display: flex; gap: 10px;">
+          <button type="button" class="btn btn-outline" onclick="closeAreaReviewModal()">Schließen</button>
+          <button type="button" class="btn btn-primary" id="reviewConfirmBtn" onclick="confirmFromReviewModal()">
+            ✓ Bereich als geprüft bestätigen
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     const dropZone = document.getElementById('dropZone');
     const csvFileInput = document.getElementById('csvFileInput');
@@ -1381,7 +1442,10 @@
         });
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
-          showModalError("Fehler bei Bereichsauswahl", errData.detail || "Bereich konnte nicht gewählt werden.");
+          const errMsg = formatErrorDetail(errData.detail || "Bereich konnte nicht gewählt werden.", res.status);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler bei Bereichsauswahl", errMsg);
           return;
         }
         const data = await res.json();
@@ -1416,7 +1480,10 @@
           updateBudgetUI(data.context_status);
         }
       } catch (err) {
-        showModalError("Verbindungsfehler", err.message);
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Verbindungsfehler", errMsg);
       }
     }
 
@@ -1430,7 +1497,10 @@
         });
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
-          showModalError("Fehler beim Bestätigen", errData.detail || "Bestätigung fehlgeschlagen.");
+          const errMsg = formatErrorDetail(errData.detail || "Bestätigung fehlgeschlagen.", res.status);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler beim Bestätigen", errMsg);
           return;
         }
         const data = await res.json();
@@ -1443,7 +1513,10 @@
           }
         }
       } catch (err) {
-        showModalError("Fehler beim Bestätigen", err.message);
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Fehler beim Bestätigen", errMsg);
       }
     }
 
@@ -1455,6 +1528,159 @@
       } else {
         confirmAreaBtn.textContent = 'Bereich prüfen';
         confirmAreaBtn.classList.remove('btn-area-confirmed');
+      }
+    }
+
+    async function openAreaReviewModal() {
+      if (!currentSelectedAreaId) return;
+      const modal = document.getElementById('areaReviewModal');
+      const titleEl = document.getElementById('reviewAreaTitle');
+      const badgeEl = document.getElementById('reviewConfirmedBadge');
+      const altSobEl = document.getElementById('reviewAltSobContent');
+      const assignedCountEl = document.getElementById('reviewAssignedCount');
+      const assignedListEl = document.getElementById('reviewAssignedEntries');
+      const unassignedSummaryEl = document.getElementById('reviewUnassignedSummary');
+      const unassignedListEl = document.getElementById('reviewUnassignedEntries');
+      const confirmBtn = document.getElementById('reviewConfirmBtn');
+
+      if (titleEl) titleEl.textContent = `${currentSelectedAreaId} ...`;
+      if (altSobEl) altSobEl.textContent = 'Lade Daten…';
+      if (assignedListEl) assignedListEl.innerHTML = '<div style="color: #94a3b8; font-size: 0.8rem;">Lade Einträge…</div>';
+      if (modal) modal.classList.add('active');
+
+      try {
+        const res = await fetch(`/api/area/${encodeURIComponent(currentSelectedAreaId)}/review`);
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          const errMsg = formatErrorDetail(errData.detail || "Daten konnten nicht geladen werden.", res.status);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler bei Bereichsprüfung", errMsg);
+          closeAreaReviewModal();
+          return;
+        }
+        const data = await res.json();
+        if (titleEl) titleEl.textContent = `${data.bereich_id} (${data.bereich_title})`;
+
+        if (badgeEl) {
+          badgeEl.style.display = data.confirmed ? 'inline-flex' : 'none';
+        }
+        if (confirmBtn) {
+          if (data.confirmed) {
+            confirmBtn.textContent = '✓ Bereich bereits geprüft (erneut bestätigen)';
+            confirmBtn.classList.add('btn-area-confirmed');
+          } else {
+            confirmBtn.textContent = '✓ Bereich als geprüft bestätigen';
+            confirmBtn.classList.remove('btn-area-confirmed');
+          }
+        }
+
+        // 1. Alt-SOB Teil rendern
+        if (altSobEl) {
+          if (data.alt_sob && data.alt_sob.has_goals) {
+            let html = '';
+            const g = data.alt_sob;
+            if (g.is_freitext_fallback) {
+              html += `<div style="margin-bottom: 6px; color: #f59e0b; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 6px; padding: 8px 10px; white-space: pre-wrap;">${escapeHtml(g.text || g.leitziel)}</div>`;
+            } else {
+              if (g.leitziel) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Leitziel:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.leitziel)}</span></div>`;
+              }
+              if (g.smarte_ziele) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Smartes Ziel:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.smarte_ziele)}</span></div>`;
+              }
+              if (g.stand_zielerreichung) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Bisherige Zielerreichung / Reflexion:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.stand_zielerreichung)}</span></div>`;
+              }
+              if (g.vorschlag_ziele) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Vorschlag für aktuelle Ziele:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.vorschlag_ziele)}</span></div>`;
+              }
+              if (g.vorschlag_massnahmen) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Vorschlag Maßnahmen:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.vorschlag_massnahmen)}</span></div>`;
+              }
+              if (g.realisierung_andere) {
+                html += `<div style="margin-bottom: 6px;"><strong style="color: #94a3b8;">Realisierung durch andere:</strong> <span style="color: #f1f5f9;">${escapeHtml(g.realisierung_andere)}</span></div>`;
+              }
+            }
+            altSobEl.innerHTML = html;
+          } else {
+            altSobEl.innerHTML = '<span style="color: #64748b; font-style: italic;">Keine Vorbericht-Ziele für diesen Lebensbereich erfasst.</span>';
+          }
+        }
+
+        // 2. Zugeordnete CSV-Einträge rendern
+        if (assignedCountEl) assignedCountEl.textContent = data.assigned_count;
+        if (assignedListEl) {
+          if (data.assigned_entries && data.assigned_entries.length > 0) {
+            assignedListEl.innerHTML = data.assigned_entries.map(e => `
+              <div style="background: #1e293b; border-radius: 6px; padding: 8px 10px; font-size: 0.8rem; line-height: 1.4;">
+                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 4px; font-size: 0.75rem; color: #94a3b8;">
+                  <span style="font-weight: 600; color: #4ade80;">📅 ${escapeHtml(e.datum || '-')}${e.uhrzeit ? ' ' + escapeHtml(e.uhrzeit) : ''}</span>
+                  ${e.kategorie ? `<span style="background: rgba(74, 222, 128, 0.15); color: #4ade80; padding: 1px 6px; border-radius: 4px;">${escapeHtml(e.kategorie)}</span>` : ''}
+                </div>
+                <div style="color: #cbd5e1;">${escapeHtml(e.text || e.formatted || '')}</div>
+              </div>
+            `).join('');
+          } else {
+            assignedListEl.innerHTML = '<div style="color: #64748b; font-size: 0.8rem; font-style: italic;">Keine Dokumentationseinträge schlüsselwortbasiert diesem Bereich zugeordnet.</div>';
+          }
+        }
+
+        // 3. Nicht zugeordnete Einträge
+        if (unassignedSummaryEl) {
+          unassignedSummaryEl.textContent = `+ ${data.unassigned_count} nicht zugeordnete Einträge (Allgemeinkontext)`;
+        }
+        if (unassignedListEl) {
+          if (data.unassigned_entries && data.unassigned_entries.length > 0) {
+            unassignedListEl.innerHTML = data.unassigned_entries.map(e => `
+              <div style="background: #1e293b; border-radius: 6px; padding: 6px 8px; font-size: 0.78rem; line-height: 1.35;">
+                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 2px; font-size: 0.72rem; color: #64748b;">
+                  <span>📅 ${escapeHtml(e.datum || '-')}${e.uhrzeit ? ' ' + escapeHtml(e.uhrzeit) : ''}</span>
+                  ${e.kategorie ? `<span>[${escapeHtml(e.kategorie)}]</span>` : ''}
+                </div>
+                <div style="color: #94a3b8;">${escapeHtml(e.text || e.formatted || '')}</div>
+              </div>
+            `).join('');
+          } else {
+            unassignedListEl.innerHTML = '<div style="color: #64748b; font-size: 0.78rem; font-style: italic;">Keine unzugeordneten Einträge vorhanden.</div>';
+          }
+        }
+
+      } catch (err) {
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Fehler bei Bereichsprüfung", errMsg);
+        closeAreaReviewModal();
+      }
+    }
+
+    function closeAreaReviewModal() {
+      const modal = document.getElementById('areaReviewModal');
+      if (modal) modal.classList.remove('active');
+    }
+
+    function toggleReviewUnassigned() {
+      const el = document.getElementById('reviewUnassignedEntries');
+      const toggle = document.getElementById('reviewUnassignedToggle');
+      if (!el) return;
+      if (el.style.display === 'none' || !el.style.display) {
+        el.style.display = 'flex';
+        if (toggle) toggle.textContent = 'Verbergen ▲';
+      } else {
+        el.style.display = 'none';
+        if (toggle) toggle.textContent = 'Anzeigen ▼';
+      }
+    }
+
+    async function confirmFromReviewModal() {
+      await confirmCurrentArea();
+      const badgeEl = document.getElementById('reviewConfirmedBadge');
+      if (badgeEl) badgeEl.style.display = 'inline-flex';
+      const confirmBtn = document.getElementById('reviewConfirmBtn');
+      if (confirmBtn) {
+        confirmBtn.textContent = '✓ Bereich bereits geprüft (erneut bestätigen)';
+        confirmBtn.classList.add('btn-area-confirmed');
       }
     }
 
@@ -1660,6 +1886,43 @@
       }
     }
 
+    function formatErrorDetail(detail, status) {
+      if (Array.isArray(detail)) {
+        detail = detail.map(d => (d && d.msg) ? d.msg : (typeof d === 'object' ? JSON.stringify(d) : String(d))).join("; ");
+      } else if (typeof detail === 'object' && detail !== null) {
+        detail = detail.msg || detail.message || detail.error || JSON.stringify(detail);
+      }
+      let fallbackMsg = "Fehler aufgetreten.";
+      if (status === 503) {
+        fallbackMsg = "Kein Modell geladen.";
+      } else if (status) {
+        fallbackMsg = `HTTP Fehler ${status}`;
+      }
+      let errorText = (detail !== undefined && detail !== null && String(detail).trim() !== "") ? String(detail).trim() : fallbackMsg;
+      if (!errorText.startsWith('❌')) {
+        errorText = `❌ ${errorText}`;
+      }
+      return errorText;
+    }
+
+    function setUploadBannerError(elementId, rawMessage) {
+      const el = document.getElementById(elementId);
+      const formatted = formatErrorDetail(rawMessage || "Upload fehlgeschlagen");
+      if (el) {
+        el.textContent = formatted;
+        el.style.display = 'block';
+      }
+      return formatted;
+    }
+
+    function clearUploadBannerError(elementId) {
+      const el = document.getElementById(elementId);
+      if (el) {
+        el.textContent = '';
+        el.style.display = 'none';
+      }
+    }
+
     async function handleFileSelected(files, newCase = false) {
       if (!files || files.length === 0) return;
       const file = files[0];
@@ -1682,39 +1945,50 @@
             return;
           }
         }
-        const data = await res.json();
-        if (data.success) {
-          if (newCase) {
-            // Bei neuem Fall UI vorab leeren
-            if (messagesContainer) messagesContainer.innerHTML = '';
-            removePlanUI();
-          }
-          updateCsvUI(
-            data.filename,
-            data.total_rows,
-            data.headers,
-            data.preview,
-            data.client_name,
-            data.source,
-            data.entries_total,
-            data.entries_in_context,
-            data.oldest_included_date
-          );
-          const notifCount = (data.entries_in_context !== undefined && data.entries_total !== undefined && data.entries_in_context < data.entries_total)
-            ? ` (${data.entries_in_context} von ${data.entries_total} Einträgen im Kontext)`
-            : ` (${data.entries_total || data.total_rows} Einträge aktiv)`;
-          appendSystemNotification(
-            `✅ CSV '${data.filename}' erfolgreich geladen${notifCount}`
-          );
-          if (data.warning) {
-            appendSystemNotification(data.warning);
-            showToast(data.warning);
-          }
-        } else {
-          showModalError("Fehler beim Laden", data.detail || data.error || "Unbekannter Fehler");
+        const data = await res.json().catch(() => ({}));
+        if (res.status >= 400 || !data.success) {
+          const errMsg = formatErrorDetail(data.detail || data.error, res.status);
+          setUploadBannerError('csvUploadError', errMsg);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler beim Laden", errMsg);
+          if (csvFileInput) csvFileInput.value = "";
+          return;
+        }
+        clearUploadBannerError('csvUploadError');
+        if (newCase) {
+          // Bei neuem Fall UI vorab leeren
+          if (messagesContainer) messagesContainer.innerHTML = '';
+          removePlanUI();
+        }
+        updateCsvUI(
+          data.filename,
+          data.total_rows,
+          data.headers,
+          data.preview,
+          data.client_name,
+          data.source,
+          data.entries_total,
+          data.entries_in_context,
+          data.oldest_included_date
+        );
+        const notifCount = (data.entries_in_context !== undefined && data.entries_total !== undefined && data.entries_in_context < data.entries_total)
+          ? ` (${data.entries_in_context} von ${data.entries_total} Einträgen im Kontext)`
+          : ` (${data.entries_total || data.total_rows} Einträge aktiv)`;
+        appendSystemNotification(
+          `✅ CSV '${data.filename}' erfolgreich geladen${notifCount}`
+        );
+        if (data.warning) {
+          appendSystemNotification(data.warning);
+          showToast(data.warning);
         }
       } catch (err) {
-        showModalError("Upload fehlgeschlagen", err.message);
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        setUploadBannerError('csvUploadError', errMsg);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Upload fehlgeschlagen", errMsg);
+        if (csvFileInput) csvFileInput.value = "";
       }
     }
 
@@ -1816,7 +2090,11 @@
       const file = files[0];
       const lower = file.name.toLowerCase();
       if (!lower.endsWith('.docx') && !lower.endsWith('.txt') && !lower.endsWith('.md')) {
-        alert("Bitte eine .docx, .txt oder .md Datei auswählen.");
+        const errMsg = setUploadBannerError('planUploadError', "Bitte eine .docx, .txt oder .md Datei auswählen.");
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Ungültiges Dateiformat", errMsg);
+        if (planFileInput) planFileInput.value = "";
         return;
       }
       const formData = new FormData();
@@ -1838,48 +2116,64 @@
             return;
           }
         }
-        const data = await res.json();
-        if (data.success) {
-          if (newCase) {
-            if (messagesContainer) messagesContainer.innerHTML = '';
-            removeCsvUI();
-          }
-          const period = (data.zeitraum_von || data.zeitraum_bis)
-            ? `${data.zeitraum_von || ''} bis ${data.zeitraum_bis || ''}`.trim()
-            : (data.zeitraum || '');
-          updatePlanUI(data.filename, data.goals_count, data.client_name, data.preview, period, data.hidden_removed);
-          if (data.template) {
-            const templateSelect = document.getElementById('exportTemplateSelect');
-            if (templateSelect) {
-              templateSelect.value = data.template;
-            }
-          }
-          if (data.available_areas) {
-            currentSelectedAreaId = null;
-            populateAreaSelect(data.available_areas, null);
-            if (areaCounters) areaCounters.style.display = 'none';
-            updateConfirmButtonState(false);
-          }
-          appendSystemNotification(
-            `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
-          );
-          if (data.warning) {
-            appendSystemNotification(data.warning);
-            showToast(data.warning);
-          } else {
-            showToast(`✓ Vorbericht geladen: ${data.filename}`);
-          }
-        } else {
-          showModalError("Fehler beim Vorbericht-Laden", data.detail || data.error || "Unbekannter Fehler");
+        const data = await res.json().catch(() => ({}));
+        if (res.status >= 400 || !data.success) {
+          const errMsg = setUploadBannerError('planUploadError', formatErrorDetail(data.detail || data.error, res.status));
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler beim Vorbericht-Laden", errMsg);
           if (planFileInput) planFileInput.value = "";
+          return;
+        }
+        clearUploadBannerError('planUploadError');
+        if (newCase) {
+          if (messagesContainer) messagesContainer.innerHTML = '';
+          removeCsvUI();
+        }
+        const period = (data.zeitraum_von || data.zeitraum_bis)
+          ? `${data.zeitraum_von || ''} bis ${data.zeitraum_bis || ''}`.trim()
+          : (data.zeitraum || '');
+        updatePlanUI(
+          data.filename,
+          data.goals_count,
+          data.client_name,
+          data.preview,
+          period,
+          data.hidden_removed,
+          data.warning,
+          data.is_fallback
+        );
+        if (data.template) {
+          const templateSelect = document.getElementById('exportTemplateSelect');
+          if (templateSelect) {
+            templateSelect.value = data.template;
+          }
+        }
+        if (data.available_areas) {
+          currentSelectedAreaId = null;
+          populateAreaSelect(data.available_areas, null);
+          if (areaCounters) areaCounters.style.display = 'none';
+          updateConfirmButtonState(false);
+        }
+        appendSystemNotification(
+          `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
+        );
+        if (data.warning) {
+          appendSystemNotification(data.warning);
+          showToast(data.warning);
+        } else {
+          showToast(`✓ Vorbericht geladen: ${data.filename}`);
         }
       } catch (err) {
-        showModalError("Upload fehlgeschlagen", err.message);
+        const errMsg = setUploadBannerError('planUploadError', formatErrorDetail(`Kommunikationsfehler: ${err.message}`));
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Upload fehlgeschlagen", errMsg);
         if (planFileInput) planFileInput.value = "";
       }
     }
 
-    function updatePlanUI(filename, goalsCount, clientName, preview, period, hiddenRemoved) {
+    function updatePlanUI(filename, goalsCount, clientName, preview, period, hiddenRemoved, warning, isFallback) {
       planLabel.textContent = `Plan: ${filename} (${goalsCount} Ziele)`;
       planPill.classList.add('active-plan');
       pulsePill(planPill);
@@ -1902,6 +2196,17 @@
         } else {
           hiddenElem.textContent = '';
           hiddenElem.style.display = 'none';
+        }
+      }
+
+      const parserWarnElem = document.getElementById('planParserWarning');
+      if (parserWarnElem) {
+        if (warning || isFallback) {
+          parserWarnElem.textContent = warning || '⚠️ Vorbericht wurde über Heuristik (Fallback) eingelesen. Bitte erkannte Bereiche prüfen.';
+          parserWarnElem.style.display = 'block';
+        } else {
+          parserWarnElem.textContent = '';
+          parserWarnElem.style.display = 'none';
         }
       }
 
@@ -1930,6 +2235,11 @@
       if (hiddenElem) {
         hiddenElem.textContent = '';
         hiddenElem.style.display = 'none';
+      }
+      const parserWarnElem = document.getElementById('planParserWarning');
+      if (parserWarnElem) {
+        parserWarnElem.textContent = '';
+        parserWarnElem.style.display = 'none';
       }
       planFileInput.value = "";
       planAccordionContent.classList.remove('open');
@@ -2147,17 +2457,7 @@
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
           contentDiv.closest('.message')?.remove();
-          let detail = errData.detail;
-          if (Array.isArray(detail)) {
-            detail = detail.map(d => (d && d.msg) ? d.msg : JSON.stringify(d)).join("; ");
-          } else if (typeof detail === 'object' && detail !== null) {
-            detail = detail.msg || detail.message || JSON.stringify(detail);
-          }
-          const fallbackMsg = response.status === 503 ? "Kein Modell geladen." : `HTTP Fehler ${response.status}`;
-          let errorText = detail || fallbackMsg;
-          if (!errorText.startsWith('❌')) {
-            errorText = `❌ ${errorText}`;
-          }
+          const errorText = formatErrorDetail(errData.detail, response.status);
           appendErrorMessage(errorText);
           allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
           return;
@@ -2692,7 +2992,16 @@
         }
         if (data.has_plan && data.plan) {
           const period = (data.plan.zeitraum_von || data.plan.zeitraum_bis) ? `${data.plan.zeitraum_von} bis ${data.plan.zeitraum_bis}` : "";
-          updatePlanUI(data.plan.filename, data.plan.goals_count, data.plan.client_name, data.plan.preview, period);
+          updatePlanUI(
+            data.plan.filename,
+            data.plan.goals_count,
+            data.plan.client_name,
+            data.plan.preview,
+            period,
+            data.plan.hidden_removed,
+            data.plan.warning,
+            data.plan.is_fallback
+          );
         }
         if (data.template) {
           const templateSelect = document.getElementById('exportTemplateSelect');

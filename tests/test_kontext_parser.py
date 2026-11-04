@@ -204,6 +204,132 @@ def test_caplog_during_parsing_contains_no_zz_synth_markers(caplog):
     assert "ZZ_SYNTH" not in caplog.text
     assert "Synthetischer Klient" not in caplog.text
 
+def test_upload_plan_fails_when_no_parser_greift(test_client):
+    """Prüft Issue #23: Wenn kein Parser-Pfad greift (0 Bereiche erkannt), liefert API 422 statt stiller Teil-Erkennung."""
+    doc = docx.Document()
+    doc.add_paragraph("Kaffee kochen und Zeitung lesen.")
+    buf = io.BytesIO()
+    doc.save(buf)
+    unparseable_bytes = buf.getvalue()
+
+    res = test_client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "kein_plan.docx",
+                io.BytesIO(unparseable_bytes),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert res.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt:" in res.json()["detail"]
+
+
+def test_upload_plan_fallback_returns_visible_warning(test_client):
+    """Prüft Issue #23: Fallback-Parser liefert sichtbare Warnung in UI/API statt stiller Erkennung."""
+    fallback_bytes = build_hamburg_vorbericht(fallback=True)
+    res = test_client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "vorbericht_fallback.docx",
+                io.BytesIO(fallback_bytes),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["success"] is True
+    assert data["goals_count"] == 9
+    assert data["is_fallback"] is True
+    assert "⚠️" in data["warning"]
+
+    # Auch /api/session enthält die Warnung für UI-Wiederherstellung
+    session_data = test_client.get("/api/session").json()
+    assert session_data["has_plan"] is True
+    assert session_data["plan"]["is_fallback"] is True
+    assert "⚠️" in session_data["plan"]["warning"]
+
+
+@pytest.mark.parametrize("ext,mime", [(".txt", "text/plain"), (".md", "text/markdown")])
+def test_upload_plan_txt_and_md_fail_closed_when_zero_goals(test_client, ext, mime):
+    """Punkt 2: Fail-closed für .txt und .md bei 0 erkannten Zielen/Bereichen -> 422 mit '❌ Kein gültiger Vorbericht erkannt…'."""
+    content = b"Kaffee kochen und Zeitung lesen ohne jegliche Ziele oder Lebensbereiche."
+    res = test_client.post(
+        "/api/upload-plan",
+        files={"file": (f"notiz{ext}", io.BytesIO(content), mime)},
+    )
+    assert res.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res.json()["detail"]
+
+
+def test_post_api_plan_fail_closed_when_zero_goals(test_client):
+    """Punkt 2: Fail-closed für POST /api/plan bei 0 erkannten Zielen/Bereichen -> 422 mit '❌ Kein gültiger Vorbericht erkannt…'."""
+    res = test_client.post(
+        "/api/plan",
+        json={"plan_text": "Beliebiger Text ohne erkennbare Ziele oder Lebensbereiche.", "filename": "notiz.txt"},
+    )
+    assert res.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res.json()["detail"]
+
+
+def test_upload_plan_txt_and_post_plan_succeed_with_valid_goals(test_client):
+    """Punkt 2 & Befund 2: Text-/Markdown-Pläne mit erkennbaren Zielen/Bereichen werden akzeptiert, liefern goals_count > 0 sowie is_fallback=True und eine sichtbare Warnung."""
+    valid_text = "Bereich 1.1 Wohnsituation\nLeitziel: ZZ_SYNTH_TXT_GOAL Erhalt der eigenen Wohnung."
+    res_upload = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("vorbericht.txt", io.BytesIO(valid_text.encode("utf-8")), "text/plain")},
+    )
+    assert res_upload.status_code == 200
+    data_up = res_upload.json()
+    assert data_up["goals_count"] >= 1
+    assert data_up["is_fallback"] is True
+    assert "⚠️" in data_up.get("warning", "")
+    assert data_up.get("parser_source") == "text_plan"
+
+    res_api = test_client.post(
+        "/api/plan",
+        json={"plan_text": valid_text, "filename": "plan.md"},
+    )
+    assert res_api.status_code == 200
+    data_api = res_api.json()
+    assert data_api["goals_count"] >= 1
+    assert data_api["is_fallback"] is True
+    assert "⚠️" in data_api.get("warning", "")
+    assert data_api.get("parser_source") == "text_plan"
+
+
+def test_parse_plan_text_no_silent_fallback_to_1_1_and_rejects_arbitrary_numbered_lines(test_client):
+    """Review-Korrektur 1: Ziel-Zeilen ohne Bereichsüberschrift werden nicht still '1.1' zugeordnet (422 ❌); beliebige nummerierte Zeilen ('2 Termine wahrgenommen') gelten nicht als Bereich."""
+    # 1. Ziel-Zeile ohne Bereichsüberschrift -> 0 Ziele -> 422 ❌
+    no_section_text = "Leitziel: ZZ_SYNTH_ORPHAN_GOAL Wohnung sauber halten ohne Bereich."
+    res_no_sec = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("orphan.txt", io.BytesIO(no_section_text.encode("utf-8")), "text/plain")},
+    )
+    assert res_no_sec.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res_no_sec.json()["detail"]
+
+    # 2. Beliebige nummerierte Zeile ('2 Termine wahrgenommen') oder ungültige ID ('Bereich 9.9') -> 0 Ziele -> 422 ❌
+    numbered_prose = "2 Termine wahrgenommen und eingekauft.\nBereich 9.9 Unbekannt\nLeitziel: Sollte nicht zugeordnet werden."
+    res_prose = test_client.post(
+        "/api/plan",
+        json={"plan_text": numbered_prose, "filename": "notiz.txt"},
+    )
+    assert res_prose.status_code == 422
+    assert "❌ Kein gültiger Vorbericht erkannt" in res_prose.json()["detail"]
+
+    # 3. Gültige Op-de-Wisch Bereichsüberschrift ('Bereich 4: Wohnen') wird akzeptiert
+    valid_odw = "Bereich 4: Wohnen\nLeitziel: ZZ_SYNTH_ODW_4 Eigene Wohnung gestalten."
+    res_odw = test_client.post(
+        "/api/plan",
+        json={"plan_text": valid_odw, "filename": "odw.txt"},
+    )
+    assert res_odw.status_code == 200
+    assert res_odw.json()["goals_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Op-de-Wisch Vorbericht-Parser, Klientenname & Falltrennung
@@ -402,3 +528,86 @@ def test_uncertain_client_name_shows_warning_instead_of_reset():
     assert bot3.has_plan is True
     assert bot3.has_csv is True
 
+
+def test_upload_plan_wrong_extension_rejected_with_message(test_client):
+    """Ungültige Dateiendungen (.pdf, .csv) bei /api/upload-plan liefern 400 mit verständlicher Fehlermeldung."""
+    # 1. PDF-Upload
+    res_pdf = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("vorbericht.pdf", io.BytesIO(b"%PDF-1.4..."), "application/pdf")},
+    )
+    assert res_pdf.status_code == 400
+    assert "❌ Bitte eine gültige .docx-, .txt- oder .md-Datei hochladen." in res_pdf.json()["detail"]
+
+    # 2. CSV-Upload
+    res_csv = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("daten.csv", io.BytesIO(b"Datum;Text\n01.01.2025;Eintrag"), "text/csv")},
+    )
+    assert res_csv.status_code == 400
+    assert "❌ Bitte eine gültige .docx-, .txt- oder .md-Datei hochladen." in res_csv.json()["detail"]
+
+
+def test_dienstplan_csv_rejected_variants(test_client):
+    """Befund 2f: Dienstplan-CSVs (synthetic_test_data und Header mit Mitarbeiter/Schicht) werden als 400 fail-closed abgelehnt."""
+    # 1. Edge-Case Fixture dienstplan_generisch.csv
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "synthetic_test_data"
+        / "04_edge_cases"
+        / "dienstplan_generisch.csv"
+    )
+    content = fixture_path.read_text(encoding="utf-8")
+    res_fixture = test_client.post(
+        "/api/upload",
+        files={"file": ("dienstplan_generisch.csv", io.BytesIO(content.encode("utf-8")), "text/csv")},
+    )
+    assert res_fixture.status_code == 400
+    assert "❌ Keine Verlaufsdokumentation erkannt" in res_fixture.json()["detail"]
+
+    # 2. Synthetischer Dienstplan mit Schicht/Dienst und Notiz
+    dienstplan_synth = (
+        "Mitarbeiter;Datum;Schicht/Dienst;Notiz\n"
+        "Max;01.01.2025;Früh;Normaler Dienst und Übergabe\n"
+        "Erika;02.01.2025;Spät;Facharztbegleitung\n"
+    )
+    res_synth = test_client.post(
+        "/api/upload",
+        files={"file": ("schichtplan.csv", io.BytesIO(dienstplan_synth.encode("utf-8")), "text/csv")},
+    )
+    assert res_synth.status_code == 400
+    assert "❌ Keine Verlaufsdokumentation erkannt" in res_synth.json()["detail"]
+
+
+def test_docx_fallback_and_client_warning_both_visible():
+    """Fallback-Vorbericht + CSV mit abweichendem unsicherem Klientennamen: Beide Warnungen bleiben erhalten und überschreiben sich nicht."""
+    bot = ReflectionChatbot(provider=ReflectionEngine())
+    client = TestClient(create_app(chatbot=bot))
+
+    # 1. Generische CSV mit Klientennamen aus Dateinamen laden
+    csv_bytes = "Datum;Kategorie;Text\n01.05.2025;Wohnen;Regulärer Verlaufseintrag".encode("utf-8")
+    res_csv = client.post(
+        "/api/upload",
+        files={"file": ("Erika_Musterfrau_Export.csv", io.BytesIO(csv_bytes), "text/csv")},
+    )
+    assert res_csv.status_code == 200
+
+    # 2. Fallback-Vorbericht mit anderem Klientennamen aus Dateinamen laden
+    fallback_docx = build_hamburg_vorbericht(fallback=True)
+    res_plan = client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "Max_Mustermann_Vorbericht.docx",
+                io.BytesIO(fallback_docx),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert res_plan.status_code == 200
+    plan_data = res_plan.json()
+    assert plan_data["is_fallback"] is True
+    # Beide Warnungen müssen im warning-Feld enthalten sein:
+    warning_text = plan_data.get("warning", "")
+    assert "Fallback" in warning_text
+    assert "Fallabweichung" in warning_text or "Klientenname in einer der Dateien nicht sicher erkannt" in warning_text

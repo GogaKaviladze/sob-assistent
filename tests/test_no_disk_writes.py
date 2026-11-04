@@ -148,6 +148,10 @@ def test_redesign_no_disk_writes(monkeypatch):
         assert res_confirm.status_code == 200
         assert bot.case.is_area_confirmed("1.4") is True
 
+        res_review = client.get("/api/area/1.4/review")
+        assert res_review.status_code == 200
+        assert res_review.json()["confirmed"] is True
+
         # D) Chat-Stream ausführen
         res_chat = client.post(
             "/api/chat-stream",

@@ -451,7 +451,7 @@ def test_diagnostics_and_logs_endpoints(client):
 def test_plan_api_endpoints(client):
     """Testet Plan-JSON-Upload, Dateiupload, Session-Darstellung und Reset via API."""
     # 1. Plan per JSON setzen
-    res = client.post("/api/plan", json={"plan_text": "Alte Ziele: Wohnung sauber halten", "filename": "plan2025.txt"})
+    res = client.post("/api/plan", json={"plan_text": "Bereich 1.1: Alte Ziele: Wohnung sauber halten", "filename": "plan2025.txt"})
     assert res.status_code == 200
     data = res.json()
     assert data["success"] is True
@@ -482,7 +482,7 @@ def test_plan_api_endpoints(client):
     assert res_invalid.status_code == 400
 
     # 4. Plan per Datei-Upload hochladen
-    plan_file = io.BytesIO(b"Zielvereinbarung 2024: Teilnahme an Kochgruppe.")
+    plan_file = io.BytesIO(b"# Bereich 1.2\nZielvereinbarung 2024: Teilnahme an Kochgruppe.")
     files = {"file": ("vorbericht.md", plan_file, "text/markdown")}
     res_upload = client.post("/api/upload-plan", files=files)
     assert res_upload.status_code == 200

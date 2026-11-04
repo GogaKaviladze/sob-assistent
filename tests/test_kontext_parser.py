@@ -527,3 +527,87 @@ def test_uncertain_client_name_shows_warning_instead_of_reset():
     assert res_csv_uncertain.json().get("warning")
     assert bot3.has_plan is True
     assert bot3.has_csv is True
+
+
+def test_upload_plan_wrong_extension_rejected_with_message(test_client):
+    """Ungültige Dateiendungen (.pdf, .csv) bei /api/upload-plan liefern 400 mit verständlicher Fehlermeldung."""
+    # 1. PDF-Upload
+    res_pdf = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("vorbericht.pdf", io.BytesIO(b"%PDF-1.4..."), "application/pdf")},
+    )
+    assert res_pdf.status_code == 400
+    assert "❌ Bitte eine gültige .docx-, .txt- oder .md-Datei hochladen." in res_pdf.json()["detail"]
+
+    # 2. CSV-Upload
+    res_csv = test_client.post(
+        "/api/upload-plan",
+        files={"file": ("daten.csv", io.BytesIO(b"Datum;Text\n01.01.2025;Eintrag"), "text/csv")},
+    )
+    assert res_csv.status_code == 400
+    assert "❌ Bitte eine gültige .docx-, .txt- oder .md-Datei hochladen." in res_csv.json()["detail"]
+
+
+def test_dienstplan_csv_rejected_variants(test_client):
+    """Befund 2f: Dienstplan-CSVs (synthetic_test_data und Header mit Mitarbeiter/Schicht) werden als 400 fail-closed abgelehnt."""
+    # 1. Edge-Case Fixture dienstplan_generisch.csv
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "synthetic_test_data"
+        / "04_edge_cases"
+        / "dienstplan_generisch.csv"
+    )
+    content = fixture_path.read_text(encoding="utf-8")
+    res_fixture = test_client.post(
+        "/api/upload",
+        files={"file": ("dienstplan_generisch.csv", io.BytesIO(content.encode("utf-8")), "text/csv")},
+    )
+    assert res_fixture.status_code == 400
+    assert "❌ Keine Verlaufsdokumentation erkannt" in res_fixture.json()["detail"]
+
+    # 2. Synthetischer Dienstplan mit Schicht/Dienst und Notiz
+    dienstplan_synth = (
+        "Mitarbeiter;Datum;Schicht/Dienst;Notiz\n"
+        "Max;01.01.2025;Früh;Normaler Dienst und Übergabe\n"
+        "Erika;02.01.2025;Spät;Facharztbegleitung\n"
+    )
+    res_synth = test_client.post(
+        "/api/upload",
+        files={"file": ("schichtplan.csv", io.BytesIO(dienstplan_synth.encode("utf-8")), "text/csv")},
+    )
+    assert res_synth.status_code == 400
+    assert "❌ Keine Verlaufsdokumentation erkannt" in res_synth.json()["detail"]
+
+
+def test_docx_fallback_and_client_warning_both_visible():
+    """Fallback-Vorbericht + CSV mit abweichendem unsicherem Klientennamen: Beide Warnungen bleiben erhalten und überschreiben sich nicht."""
+    bot = ReflectionChatbot(provider=ReflectionEngine())
+    client = TestClient(create_app(chatbot=bot))
+
+    # 1. Generische CSV mit Klientennamen aus Dateinamen laden
+    csv_bytes = "Datum;Kategorie;Text\n01.05.2025;Wohnen;Regulärer Verlaufseintrag".encode("utf-8")
+    res_csv = client.post(
+        "/api/upload",
+        files={"file": ("Erika_Musterfrau_Export.csv", io.BytesIO(csv_bytes), "text/csv")},
+    )
+    assert res_csv.status_code == 200
+
+    # 2. Fallback-Vorbericht mit anderem Klientennamen aus Dateinamen laden
+    fallback_docx = build_hamburg_vorbericht(fallback=True)
+    res_plan = client.post(
+        "/api/upload-plan",
+        files={
+            "file": (
+                "Max_Mustermann_Vorbericht.docx",
+                io.BytesIO(fallback_docx),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert res_plan.status_code == 200
+    plan_data = res_plan.json()
+    assert plan_data["is_fallback"] is True
+    # Beide Warnungen müssen im warning-Feld enthalten sein:
+    warning_text = plan_data.get("warning", "")
+    assert "Fallback" in warning_text
+    assert "Fallabweichung" in warning_text or "Klientenname in einer der Dateien nicht sicher erkannt" in warning_text

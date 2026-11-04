@@ -1442,7 +1442,10 @@
         });
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
-          showModalError("Fehler bei Bereichsauswahl", errData.detail || "Bereich konnte nicht gewählt werden.");
+          const errMsg = formatErrorDetail(errData.detail || "Bereich konnte nicht gewählt werden.", res.status);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler bei Bereichsauswahl", errMsg);
           return;
         }
         const data = await res.json();
@@ -1477,7 +1480,10 @@
           updateBudgetUI(data.context_status);
         }
       } catch (err) {
-        showModalError("Verbindungsfehler", err.message);
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Verbindungsfehler", errMsg);
       }
     }
 
@@ -1491,7 +1497,10 @@
         });
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
-          showModalError("Fehler beim Bestätigen", errData.detail || "Bestätigung fehlgeschlagen.");
+          const errMsg = formatErrorDetail(errData.detail || "Bestätigung fehlgeschlagen.", res.status);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler beim Bestätigen", errMsg);
           return;
         }
         const data = await res.json();
@@ -1504,7 +1513,10 @@
           }
         }
       } catch (err) {
-        showModalError("Fehler beim Bestätigen", err.message);
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Fehler beim Bestätigen", errMsg);
       }
     }
 
@@ -1540,7 +1552,10 @@
         const res = await fetch(`/api/area/${encodeURIComponent(currentSelectedAreaId)}/review`);
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
-          showModalError("Fehler bei Bereichsprüfung", errData.detail || "Daten konnten nicht geladen werden.");
+          const errMsg = formatErrorDetail(errData.detail || "Daten konnten nicht geladen werden.", res.status);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+          showModalError("Fehler bei Bereichsprüfung", errMsg);
           closeAreaReviewModal();
           return;
         }
@@ -1632,7 +1647,10 @@
         }
 
       } catch (err) {
-        showModalError("Fehler bei Bereichsprüfung", err.message);
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
+        showModalError("Fehler bei Bereichsprüfung", errMsg);
         closeAreaReviewModal();
       }
     }
@@ -1868,10 +1886,28 @@
       }
     }
 
+    function formatErrorDetail(detail, status) {
+      if (Array.isArray(detail)) {
+        detail = detail.map(d => (d && d.msg) ? d.msg : (typeof d === 'object' ? JSON.stringify(d) : String(d))).join("; ");
+      } else if (typeof detail === 'object' && detail !== null) {
+        detail = detail.msg || detail.message || detail.error || JSON.stringify(detail);
+      }
+      let fallbackMsg = "Fehler aufgetreten.";
+      if (status === 503) {
+        fallbackMsg = "Kein Modell geladen.";
+      } else if (status) {
+        fallbackMsg = `HTTP Fehler ${status}`;
+      }
+      let errorText = (detail !== undefined && detail !== null && String(detail).trim() !== "") ? String(detail).trim() : fallbackMsg;
+      if (!errorText.startsWith('❌')) {
+        errorText = `❌ ${errorText}`;
+      }
+      return errorText;
+    }
+
     function setUploadBannerError(elementId, rawMessage) {
       const el = document.getElementById(elementId);
-      const msg = String(rawMessage || "Upload fehlgeschlagen").trim();
-      const formatted = msg.startsWith("❌") ? msg : `❌ ${msg}`;
+      const formatted = formatErrorDetail(rawMessage || "Upload fehlgeschlagen");
       if (el) {
         el.textContent = formatted;
         el.style.display = 'block';
@@ -1911,7 +1947,10 @@
         }
         const data = await res.json().catch(() => ({}));
         if (res.status >= 400 || !data.success) {
-          const errMsg = setUploadBannerError('csvUploadError', data.detail || data.error || `Server-Fehler (${res.status})`);
+          const errMsg = formatErrorDetail(data.detail || data.error, res.status);
+          setUploadBannerError('csvUploadError', errMsg);
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
           showModalError("Fehler beim Laden", errMsg);
           if (csvFileInput) csvFileInput.value = "";
           return;
@@ -1944,7 +1983,10 @@
           showToast(data.warning);
         }
       } catch (err) {
-        const errMsg = setUploadBannerError('csvUploadError', err.message);
+        const errMsg = formatErrorDetail(`Kommunikationsfehler: ${err.message}`);
+        setUploadBannerError('csvUploadError', errMsg);
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
         showModalError("Upload fehlgeschlagen", errMsg);
         if (csvFileInput) csvFileInput.value = "";
       }
@@ -2049,7 +2091,10 @@
       const lower = file.name.toLowerCase();
       if (!lower.endsWith('.docx') && !lower.endsWith('.txt') && !lower.endsWith('.md')) {
         const errMsg = setUploadBannerError('planUploadError', "Bitte eine .docx, .txt oder .md Datei auswählen.");
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
         showModalError("Ungültiges Dateiformat", errMsg);
+        if (planFileInput) planFileInput.value = "";
         return;
       }
       const formData = new FormData();
@@ -2073,7 +2118,9 @@
         }
         const data = await res.json().catch(() => ({}));
         if (res.status >= 400 || !data.success) {
-          const errMsg = setUploadBannerError('planUploadError', data.detail || data.error || `Server-Fehler (${res.status})`);
+          const errMsg = setUploadBannerError('planUploadError', formatErrorDetail(data.detail || data.error, res.status));
+          appendErrorMessage(errMsg);
+          allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
           showModalError("Fehler beim Vorbericht-Laden", errMsg);
           if (planFileInput) planFileInput.value = "";
           return;
@@ -2118,7 +2165,9 @@
           showToast(`✓ Vorbericht geladen: ${data.filename}`);
         }
       } catch (err) {
-        const errMsg = setUploadBannerError('planUploadError', err.message);
+        const errMsg = setUploadBannerError('planUploadError', formatErrorDetail(`Kommunikationsfehler: ${err.message}`));
+        appendErrorMessage(errMsg);
+        allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
         showModalError("Upload fehlgeschlagen", errMsg);
         if (planFileInput) planFileInput.value = "";
       }
@@ -2408,17 +2457,7 @@
         if (!response.ok) {
           const errData = await response.json().catch(() => ({}));
           contentDiv.closest('.message')?.remove();
-          let detail = errData.detail;
-          if (Array.isArray(detail)) {
-            detail = detail.map(d => (d && d.msg) ? d.msg : JSON.stringify(d)).join("; ");
-          } else if (typeof detail === 'object' && detail !== null) {
-            detail = detail.msg || detail.message || JSON.stringify(detail);
-          }
-          const fallbackMsg = response.status === 503 ? "Kein Modell geladen." : `HTTP Fehler ${response.status}`;
-          let errorText = detail || fallbackMsg;
-          if (!errorText.startsWith('❌')) {
-            errorText = `❌ ${errorText}`;
-          }
+          const errorText = formatErrorDetail(errData.detail, response.status);
           appendErrorMessage(errorText);
           allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
           return;

@@ -497,12 +497,23 @@ def parse_csv_content(content: str, filename: str = "daten.csv", client_name: st
         "notiz", "text", "bericht", "verlauf", "dokumentation", "eintrag",
         "inhalt", "details", "beschreibung", "beobachtung", "bemerkung", "event",
     }
-    non_doku_cols = {"mitarbeiter", "personal", "dienst", "pause", "raum", "urlaub", "soll", "ist"}
+    strong_doku_cols = {"bericht", "verlauf", "dokumentation", "beobachtung"}
+    roster_signals = {
+        "dienstbeginn", "dienstende", "soll", "ist", "pause", "urlaub",
+        "schicht/dienst", "dienst/schicht", "schichtart", "dienstplan", "schichtplan",
+    }
     norm_headers = {h.strip().lower() for h in headers if h.strip() and not h.startswith("Spalte_")}
     has_doku_col = any(any(d in h for d in doku_text_cols) for h in norm_headers)
-    has_non_doku_col = any(any(nd in h for nd in non_doku_cols) for h in norm_headers)
+    has_strong_doku_col = any(any(sd in h for sd in strong_doku_cols) for h in norm_headers)
+    
+    # Dienstplan-/Schichtplan-Erkennung (keine Klientenverläufe)
+    dienstplan_filename = "dienstplan" in filename.lower() or "schichtplan" in filename.lower()
+    has_staff_col = any(any(sc in h for sc in ("mitarbeiter", "personal", "kolleg", "mitarbeitend")) for h in norm_headers)
+    has_shift_col = any(any(sc in h for sc in ("schicht", "dienst")) for h in norm_headers)
+    has_roster_signal = any(any(rs in h for rs in roster_signals) for h in norm_headers)
+    is_dienstplan = dienstplan_filename or (has_staff_col and has_shift_col) or has_roster_signal
 
-    if not norm_headers or not has_doku_col or (has_non_doku_col and "schicht" in norm_headers):
+    if not norm_headers or not has_doku_col or (is_dienstplan and not has_strong_doku_col):
         raise ValueError(
             "❌ Keine Verlaufsdokumentation erkannt: Die CSV-Datei enthält keine erkennbaren Dokumentationsspalten."
         )

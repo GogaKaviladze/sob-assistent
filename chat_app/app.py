@@ -319,7 +319,7 @@ def create_app(
 
         lower_name = file.filename.lower()
         if not (lower_name.endswith(".docx") or lower_name.endswith(".txt") or lower_name.endswith(".md")):
-            raise HTTPException(status_code=400, detail="Bitte eine gültige .docx-, .txt- oder .md-Datei hochladen.")
+            raise HTTPException(status_code=400, detail="❌ Bitte eine gültige .docx-, .txt- oder .md-Datei hochladen.")
 
         content_bytes = await file.read()
 

@@ -658,13 +658,26 @@ def parse_plan_text(text: str, filename: str = "vorbericht.txt") -> PlanData:
         "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
     )
 
-    odw_ids = {str(i) for i in range(1, 10)}
+    odw_only_ids = {"1", "2", "4", "5", "6", "7", "8", "9"}
+    has_hamburg_dotted = any("." in g.section_id for g in extracted_goals)
     is_odw = bool(
-        any(g.section_id in odw_ids for g in extracted_goals)
-        or "op_de_wisch" in filename.lower()
-        or "op-de-wisch" in filename.lower()
-        or "fo_svb" in filename.lower()
+        not has_hamburg_dotted
+        and (
+            any(g.section_id in odw_only_ids for g in extracted_goals)
+            or "op de wisch" in (text or "").lower()
+            or "op_de_wisch" in filename.lower()
+            or "op-de-wisch" in filename.lower()
+            or "fo_svb" in filename.lower()
+            or any(
+                g.section_id == "3" and "gesundheit" in (g.section_title or "").lower()
+                for g in extracted_goals
+            )
+        )
     )
+    if is_odw:
+        for g in extracted_goals:
+            if g.section_id == "3" and g.section_title == hamburg_title_map.get("3"):
+                g.section_title = odw_title_map["3"]
     template = "op-de-wisch" if is_odw else "hamburg"
 
     return PlanData(

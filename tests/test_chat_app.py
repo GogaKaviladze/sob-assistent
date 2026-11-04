@@ -90,6 +90,13 @@ class MockLLM(LLMProvider):
     model_name: str = "Mock-Qwen"
     is_real_llm: bool = True
     details: str = "Mock für Tests"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def __init__(self, reply: str = "Fachlicher Reflexionsimpuls"):
         self.reply = reply
@@ -687,7 +694,11 @@ def test_chat_stream_endpoint_with_csv_and_plan(client, tmp_path):
     sample_file = _create_sample_plan_docx(tmp_path)
     client.post("/api/upload-plan", files={"file": ("Hans_Peter_SVB_ausgefuellt.docx", io.BytesIO(sample_file.read_bytes()), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")})
 
-    # 3. Chat Streaming aufrufen
+    # 3. Bereich wählen und bestätigen
+    client.post("/api/area", json={"bereich_id": "1.1"})
+    client.post("/api/area/confirm", json={"bereich_id": "1.1"})
+
+    # 4. Chat Streaming aufrufen
     stream_res = client.post("/api/chat-stream", json={"message": "Wie passen die Verlaufsdaten zu den Vorberichtszielen?"})
     assert stream_res.status_code == 200
     assert "text/event-stream" in stream_res.headers["content-type"]
@@ -1188,6 +1199,34 @@ def test_card_filename_wrapping_and_containment(client):
     # 3. Tooltip-Attribut bei UI-Updates
     assert "planCardFilename.title = filename" in html
     assert "csvCardFilename.title = filename" in html
+
+
+def test_index_html_chat_stream_error_handling_shows_red_message(client):
+    """Prüft, dass bei Fehlern von /api/chat-stream (409/422/503) eine rote Chat-Meldung mit ❌ angezeigt wird (#149)."""
+    res = client.get("/")
+    assert res.status_code == 200
+    html = res.text
+
+    # 1. CSS-Regel für rote Fehlermeldungen im Chat
+    assert ".message.error" in html
+    error_css_idx = html.find(".message.error")
+    error_css_block = html[error_css_idx:html.find("}", error_css_idx)]
+    assert "#ef4444" in error_css_block
+
+    # 2. appendErrorMessage DOM-Funktion
+    assert "function appendErrorMessage(text)" in html
+
+    # 3. sendMessage: Chatfehler zeigt rote Fehlermeldung statt Modal
+    start_idx = html.find("async function sendMessage()")
+    assert start_idx != -1
+    end_idx = html.find("function setChipsDisabled", start_idx)
+    send_msg_block = html[start_idx:end_idx]
+
+    assert "showModalError" not in send_msg_block
+    assert "appendErrorMessage" in send_msg_block
+    assert "errData.detail" in send_msg_block
+    assert "allSessionMessages.push({ role: 'error'" in send_msg_block
+
 
 
 

@@ -87,10 +87,11 @@ class PlanData:
     raw_summary: str = ""
     #: True, wenn client_name nur heuristisch aus dem Dateinamen stammt (nicht für Berichtsfelder nutzen)
     client_name_from_filename: bool = False
-    hidden_removed: int = 0
     is_fallback: bool = False
+    hidden_removed: int = 0
     warning: str = ""
     parser_source: str = ""
+    template: str = ""
 
     @property
     def goals_count(self) -> int:
@@ -243,8 +244,26 @@ def parse_plan_docx(
             if hasattr(plan_result, "sections"):
                 mapped_goals: List[PlanGoalItem] = []
                 sections_dict = getattr(plan_result, "sections", {})
-                items = sections_dict.values() if isinstance(sections_dict, dict) else sections_dict
-                section_title_map = {d.id: d.title for d in SECTION_DEFINITIONS}
+                items = list(sections_dict.values()) if isinstance(sections_dict, dict) else list(sections_dict)
+                is_odw = bool(
+                    any(getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"} for g in items)
+                    or "op_de_wisch" in filename.lower()
+                    or "op-de-wisch" in filename.lower()
+                    or "fo_svb" in filename.lower()
+                )
+                defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+                section_title_map = {d.id: d.title for d in defs}
+                any_section_content = any(
+                    bool(
+                        getattr(g, "leitziel", "")
+                        or getattr(g, "smarte_ziele", "")
+                        or getattr(g, "stand_zielerreichung", "")
+                        or getattr(g, "vorschlag_ziele", "")
+                        or getattr(g, "vorschlag_massnahmen", "")
+                        or getattr(g, "realisierung_andere", "")
+                    )
+                    for g in items
+                )
                 for g in items:
                     has_content = bool(
                         getattr(g, "leitziel", "")
@@ -254,7 +273,7 @@ def parse_plan_docx(
                         or getattr(g, "vorschlag_massnahmen", "")
                     )
                     applies = getattr(g, "applies", True)
-                    if not has_content and not applies:
+                    if not any_section_content and not has_content and not applies:
                         continue
 
                     sec_id = getattr(g, "section_id", "")
@@ -288,7 +307,9 @@ def parse_plan_docx(
                         zeitraum_von = zeitraum_str.strip()
 
                 doc_client_name = getattr(plan_result, "client_name", "")
+                result_from_fn = bool(getattr(plan_result, "client_name_from_filename", False))
                 client_name = doc_client_name or extract_client_name_from_filename(filename)
+                from_fn = bool(client_name) and (not doc_client_name or result_from_fn)
                 raw_summary = getattr(plan_result, "developments", "") or getattr(plan_result, "raw_summary", "")
 
                 is_fallback = getattr(plan_result, "is_fallback", False)
@@ -299,7 +320,7 @@ def parse_plan_docx(
                     return PlanData(
                         filename=filename,
                         client_name=client_name,
-                        client_name_from_filename=bool(client_name) and not doc_client_name,
+                        client_name_from_filename=from_fn,
                         zeitraum_von=zeitraum_von,
                         zeitraum_bis=zeitraum_bis,
                         goals=mapped_goals,
@@ -308,11 +329,19 @@ def parse_plan_docx(
                         is_fallback=is_fallback,
                         warning=warning,
                         parser_source=parser_source,
+                        template="op-de-wisch" if is_odw else "hamburg",
                     )
             elif hasattr(plan_result, "goals"):
                 # Mapping falls anderes Dataclass-Objekt
                 mapped_goals = []
-                for g in getattr(plan_result, "goals", []):
+                goal_list = getattr(plan_result, "goals", [])
+                is_odw = bool(
+                    any(getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"} for g in goal_list)
+                    or "op_de_wisch" in filename.lower()
+                    or "op-de-wisch" in filename.lower()
+                    or "fo_svb" in filename.lower()
+                )
+                for g in goal_list:
                     mapped_goals.append(
                         PlanGoalItem(
                             section_id=getattr(g, "section_id", ""),
@@ -339,6 +368,7 @@ def parse_plan_docx(
                     is_fallback=getattr(plan_result, "is_fallback", False),
                     warning=getattr(plan_result, "warning", ""),
                     parser_source=getattr(plan_result, "parser_source", "fallback"),
+                    template="op-de-wisch" if is_odw else "hamburg",
                 )
     except IncompletePlanError:
         raise
@@ -491,6 +521,12 @@ def parse_plan_docx(
         client_name = extract_client_name_from_filename(filename)
         client_name_from_filename = bool(client_name)
 
+    is_odw = bool(
+        "op_de_wisch" in filename.lower()
+        or "op-de-wisch" in filename.lower()
+        or "fo_svb" in filename.lower()
+    )
+
     return PlanData(
         filename=filename,
         client_name=client_name,
@@ -502,6 +538,7 @@ def parse_plan_docx(
         is_fallback=is_fallback,
         warning=warning,
         parser_source=parser_source,
+        template="op-de-wisch" if is_odw else "hamburg",
     )
 
 
@@ -621,6 +658,15 @@ def parse_plan_text(text: str, filename: str = "vorbericht.txt") -> PlanData:
         "Bitte die erkannten Lebensbereiche vor der weiteren Bearbeitung prüfen."
     )
 
+    odw_ids = {str(i) for i in range(1, 10)}
+    is_odw = bool(
+        any(g.section_id in odw_ids for g in extracted_goals)
+        or "op_de_wisch" in filename.lower()
+        or "op-de-wisch" in filename.lower()
+        or "fo_svb" in filename.lower()
+    )
+    template = "op-de-wisch" if is_odw else "hamburg"
+
     return PlanData(
         filename=filename,
         client_name=client_name,
@@ -632,5 +678,6 @@ def parse_plan_text(text: str, filename: str = "vorbericht.txt") -> PlanData:
         is_fallback=True,
         warning=warning,
         parser_source="text_plan",
+        template=template,
     )
 

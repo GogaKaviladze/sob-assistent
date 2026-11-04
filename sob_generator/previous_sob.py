@@ -46,6 +46,7 @@ _FORMULAR_BOILERPLATE = [
     re.compile(r"^Realisierung\s+durch\s+Andere[^\n:]*:\s*", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^Antrag\s+auf\s+Haushaltshilfen\s+wird\s+bei\s+der\s+zuständigen\s+Stelle\s+beantragt[^\n:]*:\s*", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^\(z\.?\s*[bB]\.[^\)]*\)\s*", re.IGNORECASE),
+    re.compile(r"^Auswahl\s*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 
@@ -171,6 +172,7 @@ class PreviousPlanData(BaseModel):
     parser_source: str = "bookmarks"
     is_fallback: bool = False
     warning: str = ""
+    client_name_from_filename: bool = False
 
     def to_compact_context(self, max_tokens: int = 500) -> str:
         """Verdichtet Klientendaten, Entwicklungen und aktive Abschnitte auf < 2.500 Zeichen (< 500 Tokens).
@@ -255,7 +257,8 @@ class PreviousPlanData(BaseModel):
 
 
 _VISIBLE_TEXT_XPATH = (
-    ".//w:t[not(ancestor::w:sdtPr) and not(ancestor::w:del) and not(ancestor::w:moveFrom) "
+    ".//w:t[not(ancestor::w:sdtPr) and not(ancestor::w:sdt[w:sdtPr/w:showingPlcHdr]) "
+    "and not(ancestor::w:del) and not(ancestor::w:moveFrom) "
     "and not(ancestor::w:r[w:rPr/w:vanish or w:rPr/w:specVanish or w:rPr/w:webHidden])]/text()"
 )
 _W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
@@ -265,9 +268,9 @@ def _extract_element_text_with_sdt(element) -> str:
     """Extrahiert den sichtbaren Text eines WordprocessingML-Elements inkl. w:sdt (Content Controls), ohne w:sdtPr oder versteckte/gelöschte Stellen."""
     if hasattr(element, "xpath"):
         try:
-            ts = element.xpath(_VISIBLE_TEXT_XPATH)
-        except TypeError:
             ts = element.xpath(_VISIBLE_TEXT_XPATH, namespaces=_W_NS)
+        except TypeError:
+            ts = element.xpath(_VISIBLE_TEXT_XPATH)
         return "".join(ts).strip()
     return getattr(element, "text", "") or ""
 
@@ -280,9 +283,9 @@ def _extract_cell_text_with_sdt(cell) -> str:
             lines = []
             for p in paragraphs:
                 try:
-                    ts = p.xpath(_VISIBLE_TEXT_XPATH)
-                except TypeError:
                     ts = p.xpath(_VISIBLE_TEXT_XPATH, namespaces=_W_NS)
+                except TypeError:
+                    ts = p.xpath(_VISIBLE_TEXT_XPATH)
                 lines.append("".join(ts))
             return "\n".join(lines)
     return getattr(cell, "text", "") or ""
@@ -315,7 +318,7 @@ class UniversalPlanImporter:
             source = path
             fn = path.name
 
-        # 1. Versuche Fastpath über XML-Bookmarks
+        # 1. Versuche Fastpath über XML-Bookmarks (Hamburger Vorlage)
         if hasattr(source, "seek"):
             source.seek(0)
         plan = self._extract_bookmarks(source, filename=fn)
@@ -324,7 +327,16 @@ class UniversalPlanImporter:
             plan.is_fallback = False
             return plan
 
-        # 2. Fallback: Strukturierte Tabellen- und Text-Heuristik
+        # 2. Versuche Fastpath für Op-de-Wisch-Vorlage (SDT + 9 Bereichstabellen)
+        if hasattr(source, "seek"):
+            source.seek(0)
+        odw_plan = self._extract_op_de_wisch(source, filename=fn)
+        if odw_plan is not None and odw_plan.sections:
+            odw_plan.parser_source = "op_de_wisch"
+            odw_plan.is_fallback = False
+            return odw_plan
+
+        # 3. Fallback: Strukturierte Tabellen- und Text-Heuristik
         if hasattr(source, "seek"):
             source.seek(0)
         fallback_plan = self._extract_fallback(source, filename=fn)
@@ -361,6 +373,7 @@ class UniversalPlanImporter:
 
         # Klientenname
         client_name = ""
+        client_name_from_filename = False
         for name_bm in ["client_name_vorname", "client_name", "client_vorname_nachname", "wrdTN1"]:
             if name_bm in bms:
                 try:
@@ -373,6 +386,7 @@ class UniversalPlanImporter:
         if not client_name:
             fallback_source = path if isinstance(path, (str, Path)) else Path(filename or "vorbericht.docx")
             client_name = _extract_client_name_from_path(fallback_source)
+            client_name_from_filename = bool(client_name)
 
         # Zeitraum
         zeitraum = ""
@@ -463,6 +477,221 @@ class UniversalPlanImporter:
             zeitraum=zeitraum,
             developments=developments,
             sections=sections,
+            is_fallback=False,
+            client_name_from_filename=client_name_from_filename,
+        )
+
+    @staticmethod
+    def _parse_table_section(
+        table,
+        sec_id: str,
+        sec_title: str,
+        smart_pattern: str,
+    ) -> PlanSectionGoal:
+        """Extrahiert einen Lebensbereich aus einer strukturierten Bereichstabelle."""
+        lz, sz, bz, vz, vm, ra = "", "", "", "", "", ""
+        is_entfaellt = False
+        for row in table.rows:
+            seen_row_tcs = set()
+            row_cells = []
+            for c in row.cells:
+                if c._tc not in seen_row_tcs:
+                    seen_row_tcs.add(c._tc)
+                    row_cells.append(c)
+
+            row_cell_texts = [_extract_cell_text_with_sdt(c) for c in row_cells]
+            row_text = "\n".join(row_cell_texts)
+
+            if "entfällt" in row_text.lower():
+                has_w14 = (
+                    bool(
+                        row._tr.xpath(
+                            ".//*[local-name()='checkbox']/*[local-name()='checked'][@*[local-name()='val']='1']"
+                        )
+                    )
+                    if hasattr(row, "_tr")
+                    else False
+                )
+                has_box_char = bool(re.search(r"[☒☑■]\s*entfällt", row_text, re.IGNORECASE))
+                if has_w14 or has_box_char:
+                    is_entfaellt = True
+
+            if "Leitziel:" in row_text:
+                m_lz = re.search(
+                    r"Leitziel\s*:\s*(.*?)(?=(?:" + smart_pattern + r"|$))",
+                    row_text,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                if m_lz:
+                    lz = _clean(_strip_form_boilerplate(m_lz.group(1)))
+                m_sz = re.search(smart_pattern + r"\s*(.*)", row_text, re.IGNORECASE | re.DOTALL)
+                if m_sz:
+                    sz = _clean(_strip_form_boilerplate(m_sz.group(1)))
+            elif "Bericht zur Zielerreichung" in row_text:
+                parts = re.split(r"Bericht\s+zur\s+Zielerreichung[^\n:]*:\s*", row_text, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    bz = _clean(_strip_form_boilerplate(parts[1]))
+            elif "Vorschlag für aktuelle" in row_text or "Vorschlag für Maßnahmen" in row_text:
+                for c_txt in row_cell_texts:
+                    if re.search(r"Vorschlag\s+für\s+aktuelle", c_txt, re.IGNORECASE):
+                        m_vz = re.search(
+                            r"Vorschlag\s+für\s+aktuelle[^\n:]*:\s*(.*?)(?=(?:Vorschlag\s+für\s+Maßnahmen|$))",
+                            c_txt,
+                            re.IGNORECASE | re.DOTALL,
+                        )
+                        if m_vz:
+                            vz = _clean(_strip_form_boilerplate(m_vz.group(1)))
+                        else:
+                            parts_v = re.split(
+                                r"Vorschlag\s+für\s+aktuelle[^\n:]*:\s*", c_txt, flags=re.IGNORECASE
+                            )
+                            if len(parts_v) > 1:
+                                vz = _clean(_strip_form_boilerplate(parts_v[1]))
+                    if re.search(r"Vorschlag\s+für\s+Maßnahmen", c_txt, re.IGNORECASE):
+                        parts_m = re.split(
+                            r"Vorschlag\s+für\s+Maßnahmen[^\n:]*:\s*", c_txt, flags=re.IGNORECASE
+                        )
+                        if len(parts_m) > 1:
+                            vm = _clean(_strip_form_boilerplate(parts_m[1]))
+            elif "Realisierung durch Andere" in row_text or "Realisierung durch andere" in row_text:
+                m_ra = re.search(r"Realisierung\s+durch\s+Andere[^\n]*\n(.*)", row_text, re.IGNORECASE | re.DOTALL)
+                if m_ra:
+                    ra = _clean(_strip_form_boilerplate(m_ra.group(1)))
+                else:
+                    parts_ra = re.split(r"Realisierung\s+durch\s+Andere[^\n:]*:\s*", row_text, flags=re.IGNORECASE)
+                    if len(parts_ra) > 1:
+                        ra = _clean(_strip_form_boilerplate(parts_ra[1]))
+
+        has_content = bool(lz or sz or bz or vz or vm)
+        applies = has_content and not (is_entfaellt and not (lz or sz))
+        return PlanSectionGoal(
+            section_id=sec_id,
+            title=sec_title,
+            leitziel=lz,
+            smarte_ziele=sz,
+            stand_zielerreichung=bz,
+            vorschlag_ziele=vz,
+            vorschlag_massnahmen=vm,
+            realisierung_andere=ra,
+            applies=applies,
+        )
+
+    def _extract_op_de_wisch(
+        self,
+        path: Union[Path, io.BytesIO, BinaryIO],
+        filename: str = "",
+    ) -> Optional[PreviousPlanData]:
+        """Primärer Fastpath für die Op-de-Wisch-Vorlage (SDT-Kopftabelle + 9 Bereichstabellen)."""
+        fallback_source = path if isinstance(path, (str, Path)) else Path(filename or "vorbericht.docx")
+        try:
+            if hasattr(path, "seek"):
+                path.seek(0)
+            doc = docx.Document(path)
+        except Exception:
+            return None
+
+        if len(doc.tables) < 10:
+            return None
+
+        t0 = doc.tables[0]
+        if not t0._tbl.xpath(".//w:sdt"):
+            return None
+
+        t0_text = "\n".join(_extract_cell_text_with_sdt(c) for r in t0.rows for c in r.cells).lower()
+        if "op de wisch" not in t0_text and "bericht für" not in t0_text:
+            return None
+
+        # 1. Klientenname aus Tabelle 0, Zeile 0, Zelle 2 (SDT[0])
+        client_name = ""
+        client_name_from_filename = False
+        placeholders = ("name, vorname", "klient*in", "klientin", "geburtsdatum", "aktenzeichen")
+        if len(t0.rows) > 0 and len(t0.rows[0].cells) > 2:
+            c0_2 = t0.rows[0].cells[2]._tc
+            sdts_c0_2 = c0_2.xpath(".//w:sdt")
+            if sdts_c0_2:
+                raw_sdt = _clean(_extract_element_text_with_sdt(sdts_c0_2[0]))
+                if raw_sdt and not any(ph in raw_sdt.lower() for ph in placeholders):
+                    client_name = raw_sdt
+            if not client_name:
+                cell_txt = _extract_cell_text_with_sdt(t0.rows[0].cells[2])
+                m_c = re.search(
+                    r"Bericht\s+für\s*(?:\(Name,\s*Vorname\))?\s*:[ \t\u00a0]*([^\n\t\r]+)",
+                    cell_txt,
+                    re.IGNORECASE,
+                )
+                if m_c:
+                    raw_c = _clean(m_c.group(1))
+                    if raw_c and not any(ph in raw_c.lower() for ph in placeholders):
+                        client_name = raw_c
+
+        if not client_name:
+            client_name = _extract_client_name_from_path(fallback_source)
+            client_name_from_filename = bool(client_name)
+
+        # 2. Berichtszeitraum aus Tabelle 0, Zeile 3, Zelle 0 (SDT[1])
+        zeitraum = ""
+        if len(t0.rows) > 3 and len(t0.rows[3].cells) > 0:
+            c3_0 = t0.rows[3].cells[0]._tc
+            sdts_c3_0 = c3_0.xpath(".//w:sdt")
+            raw_zr = ""
+            if len(sdts_c3_0) > 1:
+                raw_zr = _clean(_extract_element_text_with_sdt(sdts_c3_0[1]))
+            if not raw_zr:
+                raw_zr = _extract_cell_text_with_sdt(t0.rows[3].cells[0])
+            m_zr = re.search(
+                r"([0-9]{2}\.[0-9]{2}\.[0-9]{4})\s*(?:bis|-)\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})",
+                raw_zr,
+                re.IGNORECASE,
+            )
+            if m_zr:
+                zeitraum = f"{m_zr.group(1)} bis {m_zr.group(2)}"
+
+        # 3. Wesentliche Entwicklungen aus Tabelle 0, Zeile 4, Zelle 0
+        developments = ""
+        if len(t0.rows) > 4 and len(t0.rows[4].cells) > 0:
+            c4_txt = _extract_cell_text_with_sdt(t0.rows[4].cells[0])
+            c4_clean = re.sub(
+                r"^\s*Wesentliche\s+(?:aktuelle\s+)?Entwicklungen\s+im\s+Berichtszeitraum\s*:\s*",
+                "",
+                c4_txt,
+                flags=re.IGNORECASE,
+            )
+            developments = _clean(c4_clean)
+
+        # 4. 9 Lebensbereiche aus Tabellen 1..N
+        allowlist_map = {d.id: d for d in OP_DE_WISCH_SECTION_DEFINITIONS}
+        main_id_re = re.compile(r"^(\d+(?:\.\d+)?)\.?\s*(.*)$")
+        smart_pattern = r"(?:S\.?M\.?A\.?R\.?T\.?|Smarte?)\s*Ziele?\s*:"
+
+        sections: Dict[str, PlanSectionGoal] = {}
+        detected_headings: List[str] = []
+
+        for table in doc.tables[1:]:
+            if not table.rows or not table.rows[0].cells:
+                continue
+            head_txt = _extract_cell_text_with_sdt(table.cell(0, 0)).strip()
+            m_main = main_id_re.match(head_txt)
+            if not m_main:
+                continue
+            cand_id = m_main.group(1)
+            if cand_id not in allowlist_map:
+                continue
+            detected_headings.append(cand_id)
+            if cand_id in sections:
+                raise IncompletePlanError(found=len(sections), expected=len(detected_headings))
+            sec_title = m_main.group(2).strip() or allowlist_map[cand_id].title
+            sections[cand_id] = self._parse_table_section(table, cand_id, sec_title, smart_pattern)
+
+        if set(sections.keys()) != set(allowlist_map.keys()):
+            return None
+
+        return PreviousPlanData(
+            client_name=client_name,
+            zeitraum=zeitraum,
+            developments=developments,
+            sections=sections,
+            is_fallback=False,
+            client_name_from_filename=client_name_from_filename,
         )
 
     def _extract_fallback(
@@ -477,10 +706,16 @@ class UniversalPlanImporter:
                 path.seek(0)
             doc = docx.Document(path)
         except Exception:
-            return PreviousPlanData(client_name=_extract_client_name_from_path(fallback_source))
+            fn_client = _extract_client_name_from_path(fallback_source)
+            return PreviousPlanData(
+                client_name=fn_client,
+                is_fallback=True,
+                client_name_from_filename=bool(fn_client),
+            )
 
         sections: Dict[str, PlanSectionGoal] = {}
         client_name = ""
+        client_name_from_filename = False
         zeitraum = ""
         developments = ""
 
@@ -502,13 +737,21 @@ class UniversalPlanImporter:
         combined_text = "\n".join(all_texts)
 
         # Klientenname
-        m_client = re.search(r"Bericht\s+für\s*(?:\(Name,\s*Vorname\))?\s*:\s*([^\n\t\r]+)", combined_text, re.IGNORECASE)
+        m_client = re.search(
+            r"Bericht\s+für\s*(?:\(Name,\s*Vorname\))?\s*:[ \t\u00a0]*([^\n\t\r]+)",
+            combined_text,
+            re.IGNORECASE,
+        )
         if m_client:
             raw_client = _clean(m_client.group(1))
-            if raw_client and not any(ph in raw_client.lower() for ph in ["name, vorname", "klient*in", "klientin", "geburtsdatum"]):
+            if raw_client and not any(
+                ph in raw_client.lower()
+                for ph in ["name, vorname", "klient*in", "klientin", "geburtsdatum", "aktenzeichen"]
+            ):
                 client_name = raw_client
         if not client_name:
             client_name = _extract_client_name_from_path(fallback_source)
+            client_name_from_filename = bool(client_name)
 
         # Zeitraum
         m_zr = re.search(
@@ -601,74 +844,7 @@ class UniversalPlanImporter:
 
             sec_id = candidate_id
             sec_title = candidate_title or allowlist_map[candidate_id].title
-
-            lz, sz, bz, vz, vm, ra = "", "", "", "", "", ""
-            is_entfaellt = False
-            for row in table.rows:
-                seen_row_tcs = set()
-                row_cells = []
-                for c in row.cells:
-                    if c._tc not in seen_row_tcs:
-                        seen_row_tcs.add(c._tc)
-                        row_cells.append(c)
-
-                row_cell_texts = [_extract_cell_text_with_sdt(c) for c in row_cells]
-                row_text = "\n".join(row_cell_texts)
-
-                if "entfällt" in row_text.lower():
-                    has_w14 = bool(row._tr.xpath(".//*[local-name()='checkbox']/*[local-name()='checked'][@*[local-name()='val']='1']")) if hasattr(row, "_tr") else False
-                    has_box_char = bool(re.search(r"[☒☑■]\s*entfällt", row_text, re.IGNORECASE))
-                    if has_w14 or has_box_char:
-                        is_entfaellt = True
-
-                if "Leitziel:" in row_text:
-                    m_lz = re.search(r"Leitziel\s*:\s*(.*?)(?=(?:" + smart_pattern + r"|$))", row_text, re.IGNORECASE | re.DOTALL)
-                    if m_lz:
-                        lz = _clean(_strip_form_boilerplate(m_lz.group(1)))
-                    m_sz = re.search(smart_pattern + r"\s*(.*)", row_text, re.IGNORECASE | re.DOTALL)
-                    if m_sz:
-                        sz = _clean(_strip_form_boilerplate(m_sz.group(1)))
-                elif "Bericht zur Zielerreichung" in row_text:
-                    parts = re.split(r"Bericht\s+zur\s+Zielerreichung[^\n:]*:\s*", row_text, flags=re.IGNORECASE)
-                    if len(parts) > 1:
-                        bz = _clean(_strip_form_boilerplate(parts[1]))
-                elif "Vorschlag für aktuelle" in row_text or "Vorschlag für Maßnahmen" in row_text:
-                    # Getrennte Auswertung der Zellen (Ziele -> vz, Maßnahmen -> vm)
-                    for c_txt in row_cell_texts:
-                        if re.search(r"Vorschlag\s+für\s+aktuelle", c_txt, re.IGNORECASE):
-                            m_vz = re.search(r"Vorschlag\s+für\s+aktuelle[^\n:]*:\s*(.*?)(?=(?:Vorschlag\s+für\s+Maßnahmen|$))", c_txt, re.IGNORECASE | re.DOTALL)
-                            if m_vz:
-                                vz = _clean(_strip_form_boilerplate(m_vz.group(1)))
-                            else:
-                                parts_v = re.split(r"Vorschlag\s+für\s+aktuelle[^\n:]*:\s*", c_txt, flags=re.IGNORECASE)
-                                if len(parts_v) > 1:
-                                    vz = _clean(_strip_form_boilerplate(parts_v[1]))
-                        if re.search(r"Vorschlag\s+für\s+Maßnahmen", c_txt, re.IGNORECASE):
-                            parts_m = re.split(r"Vorschlag\s+für\s+Maßnahmen[^\n:]*:\s*", c_txt, flags=re.IGNORECASE)
-                            if len(parts_m) > 1:
-                                vm = _clean(_strip_form_boilerplate(parts_m[1]))
-                elif "Realisierung durch Andere" in row_text or "Realisierung durch andere" in row_text:
-                    m_ra = re.search(r"Realisierung\s+durch\s+Andere[^\n]*\n(.*)", row_text, re.IGNORECASE | re.DOTALL)
-                    if m_ra:
-                        ra = _clean(_strip_form_boilerplate(m_ra.group(1)))
-                    else:
-                        parts_ra = re.split(r"Realisierung\s+durch\s+Andere[^\n:]*:\s*", row_text, flags=re.IGNORECASE)
-                        if len(parts_ra) > 1:
-                            ra = _clean(_strip_form_boilerplate(parts_ra[1]))
-
-            has_content = bool(lz or sz or bz or vz or vm)
-            applies = has_content and not (is_entfaellt and not (lz or sz))
-            sections[sec_id] = PlanSectionGoal(
-                section_id=sec_id,
-                title=sec_title,
-                leitziel=lz,
-                smarte_ziele=sz,
-                stand_zielerreichung=bz,
-                vorschlag_ziele=vz,
-                vorschlag_massnahmen=vm,
-                realisierung_andere=ra,
-                applies=applies,
-            )
+            sections[sec_id] = self._parse_table_section(table, sec_id, sec_title, smart_pattern)
 
         # 3. Falls keine Tabellenabschnitte gefunden: Paragraph-Scan
         if not sections:
@@ -735,6 +911,8 @@ class UniversalPlanImporter:
             zeitraum=zeitraum,
             developments=developments,
             sections=sections,
+            is_fallback=True,
+            client_name_from_filename=client_name_from_filename,
         )
 
     def _parse_section_text(self, text: str, smart_pattern: str) -> Tuple[str, str, str, str]:

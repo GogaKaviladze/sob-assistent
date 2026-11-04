@@ -49,6 +49,13 @@ class MemoryMockLLM(LLMProvider):
     model_name: str = "MemoryMockLLM"
     is_real_llm: bool = True
     details: str = "In-Memory Test LLM"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def __init__(self):
         self.reset_called = False

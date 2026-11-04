@@ -19,6 +19,7 @@ class CaseSession:
     """Hält alle Daten eines einzelnen Klientenfalls strikt im RAM."""
 
     fall_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    template: str = "hamburg"
     csv: Optional[CsvData] = None
     plan: Optional[PlanData] = None
     plan_context: Optional[str] = None
@@ -58,6 +59,7 @@ class CaseSession:
 
     def clear(self) -> None:
         """Setzt sämtliche Falldaten zurück."""
+        self.template = "hamburg"
         self.csv = None
         self.plan = None
         self.plan_context = None

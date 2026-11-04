@@ -33,6 +33,13 @@ class SlowMockLLM(LLMProvider):
     model_name: str = "SlowMockLLM"
     is_real_llm: bool = True
     details: str = "Mock für Nebenläufigkeits-Tests"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def __init__(self, reply: str = "### Bereich 1.4 – Emotionale und psychische Entwicklung\nAntwort"):
         self.reply = reply
@@ -62,6 +69,13 @@ class QuickMockLLM(LLMProvider):
     model_name: str = "QuickMockLLM"
     is_real_llm: bool = True
     details: str = "Schneller Mock"
+    n_ctx: int = 16384
+    max_tokens: int = 2048
+
+    def count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(text.split())
 
     def __init__(self, reply: str = "Antwort"):
         self.reply = reply
@@ -372,7 +386,6 @@ def test_area_confirm_flag_ram_only():
     res_bad = client.post("/api/area/confirm", json={"bereich_id": "99.9"})
     assert res_bad.status_code == 422
 
-
 def test_area_review_shows_assigned_entries_and_alt_sob():
     """Prüft Issue #23: 'Bereich prüfen' liefert die zugeordneten CSV-Einträge und den Alt-SOB-Teil."""
     bot = ReflectionChatbot(provider=QuickMockLLM())
@@ -549,3 +562,284 @@ def test_ui_upload_error_banner_present_in_index_html():
     # Modal nutzt konsistent 'active' statt 'open'
     assert "modal.classList.add('open')" not in html
 
+
+def test_chat_stream_without_confirmed_area_returns_409_and_does_not_call_llm(caplog):
+    """POST /api/chat-stream ohne bestätigten Bereich (wenn Plan geladen) -> 409, kein Modellaufruf."""
+    mock_llm = QuickMockLLM(reply="Synthetische Modellantwort")
+    mock_llm.generate = MagicMock(wraps=mock_llm.generate)
+    mock_llm.generate_stream = MagicMock(wraps=mock_llm.generate_stream)
+
+    bot = ReflectionChatbot(provider=mock_llm)
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    docx_bytes = build_hamburg_vorbericht()
+    with caplog.at_level(logging.DEBUG):
+        res_plan = client.post(
+            "/api/upload-plan",
+            files={"file": ("vorbericht_synth.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        )
+        assert res_plan.status_code == 200
+
+        # 1. Ohne gewählten/bestätigten Bereich -> 409 mit "❌ Bitte zuerst einen Lebensbereich wählen"
+        res_no_area = client.post("/api/chat-stream", json={"message": "Frage zum Wohnen"})
+        assert res_no_area.status_code == 409
+        assert res_no_area.json()["detail"] == "❌ Bitte zuerst einen Lebensbereich wählen"
+        mock_llm.generate.assert_not_called()
+        mock_llm.generate_stream.assert_not_called()
+        assert len(mock_llm.last_messages) == 0
+
+        # 2. Bereich nur gewählt, aber noch nicht bestätigt -> 409 mit "❌ Bitte den Bereich mit „Bereich prüfen“ bestätigen"
+        res_sel = client.post("/api/area", json={"bereich_id": "1.4"})
+        assert res_sel.status_code == 200
+        res_unconfirmed = client.post("/api/chat-stream", json={"message": "Frage zum Wohnen"})
+        assert res_unconfirmed.status_code == 409
+        assert res_unconfirmed.json()["detail"] == "❌ Bitte den Bereich mit „Bereich prüfen“ bestätigen"
+        mock_llm.generate.assert_not_called()
+        mock_llm.generate_stream.assert_not_called()
+        assert len(mock_llm.last_messages) == 0
+
+        # 3. Nach Bestätigung -> 200 und Modell wird aufgerufen
+        res_conf = client.post("/api/area/confirm", json={"bereich_id": "1.4"})
+        assert res_conf.status_code == 200
+        res_ok = client.post("/api/chat-stream", json={"message": "Frage zu 1.4"})
+        assert res_ok.status_code == 200
+        mock_llm.generate_stream.assert_called_once()
+
+    assert "Synthetischer Klient" not in caplog.text
+
+
+def test_area_confirm_validates_against_loaded_template(caplog):
+    """POST /api/area/confirm und POST /api/area prüfen bereich_id gegen die Bereiche der geladenen Vorlage."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. Hamburger Vorlage geladen -> Op-de-Wisch-Bereich "4" ist unbekannt für diese Vorlage
+    docx_bytes = build_hamburg_vorbericht()
+    with caplog.at_level(logging.DEBUG):
+        res_plan = client.post(
+            "/api/upload-plan",
+            files={"file": ("vorbericht_synth.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        )
+        assert res_plan.status_code == 200
+
+        res_area_bad = client.post("/api/area", json={"bereich_id": "4"})
+        assert res_area_bad.status_code == 422
+        assert res_area_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+
+        res_conf_bad = client.post("/api/area/confirm", json={"bereich_id": "4"})
+        assert res_conf_bad.status_code == 422
+        assert res_conf_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+        assert bot.case.is_area_confirmed("4") is False
+
+        # 2. Op-de-Wisch-Vorlage im RAM -> Hamburger Bereich "1.4" ist unbekannt für diese Vorlage
+        bot.set_plan(
+            PlanData(
+                filename="odw_synth.docx",
+                client_name="Synthetischer Klient",
+                goals=[PlanGoalItem(section_id="4", section_title="Wohnen")],
+            )
+        )
+        res_area_odw_bad = client.post("/api/area", json={"bereich_id": "1.4"})
+        assert res_area_odw_bad.status_code == 422
+        assert res_area_odw_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+
+        res_conf_odw_bad = client.post("/api/area/confirm", json={"bereich_id": "1.4"})
+        assert res_conf_odw_bad.status_code == 422
+        assert res_conf_odw_bad.json()["detail"] == "❌ Bereich gehört nicht zur Vorlage"
+        assert bot.case.is_area_confirmed("1.4") is False
+
+    assert "Synthetischer Klient" not in caplog.text
+
+
+def test_ui_send_message_shows_red_error_in_chat_on_error_status():
+    """Prüft, dass sendMessage in index.html bei HTTP 409/422/503 eine rote Meldung im Chat mit der ❌-Meldung anzeigt."""
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    res = client.get("/")
+    assert res.status_code == 200
+    html = res.text
+
+    # 1. CSS-Klasse für Fehlermeldungen im Chat (.message.error) mit rotem Styling
+    assert ".message.error" in html
+    error_css_idx = html.find(".message.error")
+    error_css_block = html[error_css_idx:html.find("}", error_css_idx)]
+    assert "#ef4444" in error_css_block or "var(--danger)" in error_css_block
+
+    # 2. appendErrorMessage Funktion vorhanden
+    assert "function appendErrorMessage(" in html
+
+    # 3. sendMessage block prüft auf Fehler und ruft appendErrorMessage auf
+    start_idx = html.find("async function sendMessage()")
+    assert start_idx != -1
+    end_idx = html.find("function setChipsDisabled", start_idx)
+    send_msg_block = html[start_idx:end_idx]
+
+    # Kein showModalError bei Chat-Fehlern mehr, sondern rote Meldung im Chat
+    assert "showModalError" not in send_msg_block
+    assert "appendErrorMessage" in send_msg_block
+    assert "errData.detail" in send_msg_block
+    assert "❌" in send_msg_block
+
+    # 4. renderFilteredMessages berücksichtigt error-Rolle im Chatverlauf
+    render_idx = html.find("function renderFilteredMessages()")
+    assert render_idx != -1
+    render_block = html[render_idx:html.find("function setPresentationMode", render_idx)]
+    assert "appendErrorMessage" in render_block
+
+
+# ===========================================================================
+# 8. Bereichsauswahl für Op de Wisch Vorlage (Issue #149)
+# ===========================================================================
+
+def test_odw_vorbericht_upload_yields_op_de_wisch_areas_in_api():
+    """(a) Nach Upload eines Op-de-Wisch-Vorberichts liefert die API für die Bereichsauswahl
+    die Op-de-Wisch-Bereiche (OP_DE_WISCH_SECTION_DEFINITIONS), nicht die Hamburg-Bereiche."""
+    from tests.fixtures.make_synthetic_vorbericht_opdewisch import build_opdewisch_vorbericht
+    from sob_generator.llm.sections_op_de_wisch import OP_DE_WISCH_SECTION_DEFINITIONS
+    from sob_generator.llm.sections import SECTION_DEFINITIONS
+
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    odw_bytes = build_opdewisch_vorbericht()
+    res_upload = client.post(
+        "/api/upload-plan",
+        files={"file": ("Hans_Peter_Vorbericht_OpDeWisch.docx", odw_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res_upload.status_code == 200
+
+    # API für Bereichsauswahl abfragen (/api/areas)
+    res_areas = client.get("/api/areas")
+    assert res_areas.status_code == 200
+    areas_data = res_areas.json()
+    areas = areas_data.get("available_areas") or areas_data.get("areas")
+    assert [a["id"] for a in areas] == [s.id for s in OP_DE_WISCH_SECTION_DEFINITIONS]
+    assert [a["title"] for a in areas] == [s.title for s in OP_DE_WISCH_SECTION_DEFINITIONS]
+
+    # Sicherstellen, dass NICHT die Hamburg-Bereiche zurückgegeben wurden
+    hamburg_ids = [s.id for s in SECTION_DEFINITIONS]
+    assert [a["id"] for a in areas] != hamburg_ids
+
+
+def test_odw_vorbericht_sets_template_automatically_to_op_de_wisch():
+    """(b) Die Vorlage wird aus dem erkannten Vorbericht automatisch auf Op de Wisch gesetzt."""
+    from tests.fixtures.make_synthetic_vorbericht_opdewisch import build_opdewisch_vorbericht
+
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    odw_bytes = build_opdewisch_vorbericht()
+    res_upload = client.post(
+        "/api/upload-plan",
+        files={"file": ("Hans_Peter_Vorbericht_OpDeWisch.docx", odw_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res_upload.status_code == 200
+    upload_data = res_upload.json()
+    assert upload_data.get("template") == "op-de-wisch"
+
+    # Auch im Session-Status hinterlegt
+    res_session = client.get("/api/session")
+    assert res_session.status_code == 200
+    assert res_session.json().get("template") == "op-de-wisch"
+
+    # UI enthält Code zur automatischen Auswahl von Op de Wisch bei Vorbericht-Erkennung
+    res_ui = client.get("/")
+    assert res_ui.status_code == 200
+    html = res_ui.text
+    assert "exportTemplateSelect" in html
+    assert "data.template" in html
+
+
+def test_template_switch_in_ui_reloads_matching_area_list():
+    """(c) Umschalten der Vorlage im UI lädt die passende Bereichsliste neu."""
+    from sob_generator.llm.sections_op_de_wisch import OP_DE_WISCH_SECTION_DEFINITIONS
+    from sob_generator.llm.sections import SECTION_DEFINITIONS
+
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. UI-Markup und Handler prüfen
+    res_ui = client.get("/")
+    assert res_ui.status_code == 200
+    html = res_ui.text
+    # exportTemplateSelect muss ein onchange-Event haben, das die Bereichsliste aktualisiert
+    assert 'id="exportTemplateSelect"' in html
+    assert 'handleTemplateChange' in html
+
+    # 2. Umschalten auf Op de Wisch liefert Op-de-Wisch-Bereiche
+    res_odw = client.get("/api/areas?template=op-de-wisch")
+    assert res_odw.status_code == 200
+    odw_areas = res_odw.json().get("available_areas") or res_odw.json().get("areas")
+    assert [a["id"] for a in odw_areas] == [s.id for s in OP_DE_WISCH_SECTION_DEFINITIONS]
+
+    # 3. Umschalten zurück auf Hamburg liefert Hamburg-Bereiche
+    res_hh = client.get("/api/areas?template=hamburg")
+    assert res_hh.status_code == 200
+    hh_areas = res_hh.json().get("available_areas") or res_hh.json().get("areas")
+    assert [a["id"] for a in hh_areas] == [s.id for s in SECTION_DEFINITIONS]
+
+
+def test_op_de_wisch_area_3_gesundheit_selectable_and_confirmable():
+    """(d) Op-de-Wisch-Bereich 3 (Gesundheit) ist wähl- und bestätigbar."""
+    from tests.fixtures.make_synthetic_vorbericht_opdewisch import build_opdewisch_vorbericht
+
+    bot = ReflectionChatbot(provider=QuickMockLLM())
+    app = create_app(chatbot=bot)
+    client = TestClient(app)
+
+    # 1. Fall A: Nach Vorbericht-Upload
+    odw_bytes = build_opdewisch_vorbericht()
+    res_upload = client.post(
+        "/api/upload-plan",
+        files={"file": ("Hans_Peter_Vorbericht_OpDeWisch.docx", odw_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res_upload.status_code == 200
+
+    # 1a. Chat ohne Bereichswahl -> 409 "❌ Bitte zuerst einen Lebensbereich wählen"
+    res_chat_no_area = client.post("/api/chat-stream", json={"message": "Frage zu ODW"})
+    assert res_chat_no_area.status_code == 409
+    assert res_chat_no_area.json()["detail"] == "❌ Bitte zuerst einen Lebensbereich wählen"
+
+    res_area = client.post("/api/area", json={"bereich_id": "3"})
+    assert res_area.status_code == 200
+    data_area = res_area.json()
+    assert data_area["bereich_id"] == "3"
+    assert data_area["title"] == "Gesundheit"
+    assert "Arbeit" not in data_area["title"]
+
+    # 1b. Chat mit gewähltem, aber noch unbestätigtem Bereich -> 409 "❌ Bitte den Bereich mit „Bereich prüfen“ bestätigen"
+    res_chat_unconf = client.post("/api/chat-stream", json={"message": "Frage zu Bereich 3"})
+    assert res_chat_unconf.status_code == 409
+    assert res_chat_unconf.json()["detail"] == "❌ Bitte den Bereich mit „Bereich prüfen“ bestätigen"
+
+    res_confirm = client.post("/api/area/confirm", json={"bereich_id": "3"})
+    assert res_confirm.status_code == 200
+    assert res_confirm.json()["confirmed"] is True
+    assert bot.case.is_area_confirmed("3") is True
+
+    # 1c. Chat nach Bestätigung -> 200
+    res_chat_ok = client.post("/api/chat-stream", json={"message": "Frage zu Bereich 3"})
+    assert res_chat_ok.status_code == 200
+
+    # 2. Fall B: Umschalten der Vorlage auf Op de Wisch ohne Plan (oder neuer Fall)
+    bot.clear()
+    res_switch = client.post("/api/template", json={"template": "op-de-wisch"})
+    assert res_switch.status_code == 200
+    assert res_switch.json()["template"] == "op-de-wisch"
+
+    res_area2 = client.post("/api/area", json={"bereich_id": "3"})
+    assert res_area2.status_code == 200
+    assert res_area2.json()["title"] == "Gesundheit"
+    assert "Arbeit" not in res_area2.json()["title"]
+
+    res_confirm2 = client.post("/api/area/confirm", json={"bereich_id": "3"})
+    assert res_confirm2.status_code == 200
+    assert res_confirm2.json()["confirmed"] is True
+    assert bot.case.is_area_confirmed("3") is True

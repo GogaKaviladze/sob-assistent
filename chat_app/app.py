@@ -74,28 +74,78 @@ class SelectAreaRequest(BaseModel):
     bereich_id: ValidAreaId
 
 
-def _validate_area_compatibility(bot: ReflectionChatbot, bereich_id: str) -> None:
-    """Prüft, ob die gewählte Bereichs-ID zur geladenen Vorbericht-Vorlage passt (Befund 3)."""
-    is_odw = bool(
-        bot.plan_data
-        and any(
-            getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-            for g in getattr(bot.plan_data, "goals", [])
-        )
-    )
-    if is_odw and bereich_id in {"1.1", "1.2", "1.3", "1.4", "1.5", "2.1", "2.2", "2.3"}:
-        raise HTTPException(
-            status_code=422,
-            detail="❌ Ungültiger Lebensbereich für geladene Op de Wisch Vorlage.",
-        )
-    if not is_odw and bot.plan_data and bereich_id in {"1", "2", "4", "5", "6", "7", "8", "9"}:
-        raise HTTPException(
-            status_code=422,
-            detail="❌ Ungültiger Lebensbereich für Hamburger Vorlage.",
-        )
+class SelectTemplateRequest(BaseModel):
+    template: str
 
 
 DEFAULT_DOCX_PARSE_TIMEOUT = 10.0
+
+_GENERIC_CLIENT_NAMES = {
+    "klient*in (anonymisiert)",
+    "klient*in",
+    "anonymisiert",
+    "synthetischer klient",
+    "vorlage",
+    "fosvorlage",
+    "",
+}
+
+
+def _canonical_client_name(name: str) -> str:
+    """Normalisiert Klientennamen ('Nachname, Vorname' -> 'vorname nachname') für den Fallabgleich."""
+    raw = (name or "").strip()
+    if not raw or raw.lower() in _GENERIC_CLIENT_NAMES:
+        return ""
+    if any(ph in raw.lower() for ph in ("name, vorname", "klient*in", "klientin")):
+        return ""
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",", 1)]
+        raw = f"{parts[1]} {parts[0]}".strip()
+    return " ".join(raw.lower().split())
+
+
+def _evaluate_client_match(
+    existing_name: str,
+    existing_from_filename: bool,
+    new_name: str,
+    new_from_filename: bool,
+) -> tuple[bool, str]:
+    """Prüft auf Klientenkonflikt zwischen bestehendem Fall und neuem Upload.
+
+    Gibt (client_conflict, warning) zurück:
+    - client_conflict=True nur wenn beide Namen sicher erkannt (nicht aus Dateinamen) und abweichend sind.
+    - warning (nicht-leer) wenn ein abweichender oder fehlender Name unsicher ist (kein Reset).
+    """
+    c_exist = _canonical_client_name(existing_name)
+    c_new = _canonical_client_name(new_name)
+    if not c_exist and not c_new:
+        return False, ""
+    if not c_exist or not c_new:
+        return (
+            False,
+            "⚠️ Klientenname in einer der Dateien nicht sicher erkannt – kein automatischer Fall-Reset. Bitte Fallzugehörigkeit prüfen.",
+        )
+
+    exist_tokens = set(c_exist.split())
+    new_tokens = set(c_new.split())
+    same_client = (
+        c_exist == c_new
+        or c_exist in c_new
+        or c_new in c_exist
+        or (len(exist_tokens) >= 2 and exist_tokens == new_tokens)
+    )
+    if same_client:
+        return False, ""
+
+    exist_confident = not existing_from_filename and len(exist_tokens) >= 2
+    new_confident = not new_from_filename and len(new_tokens) >= 2
+    if exist_confident and new_confident:
+        return True, ""
+
+    return (
+        False,
+        "⚠️ Klientenname nicht sicher erkannt (nur aus Dateiname abgeleitet oder unvollständig) – kein automatischer Fall-Reset. Bitte Fallzugehörigkeit prüfen.",
+    )
 
 
 def get_docx_parse_timeout() -> float:
@@ -129,6 +179,15 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         # M5: Rohwerte niemals in Response Body oder Logs spiegeln
+        has_path_area_error = any(
+            "bereich_id" in err.get("loc", ()) or "path" in err.get("loc", ())
+            for err in exc.errors()
+        )
+        if has_path_area_error:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "❌ Ungültiger Lebensbereich."},
+            )
         clean_errors = []
         for err in exc.errors():
             clean_err = {k: v for k, v in err.items() if k != "input"}
@@ -199,21 +258,21 @@ def create_app(
         is_vivendi = bool(parsed_csv.entries) or ("vivendi" in file.filename.lower())
         source = "Vivendi PD Verlaufsbericht" if is_vivendi else f"Verlaufsdokumentation ({file.filename})"
 
+        warning = ""
         if not new_case:
             # Konfliktprüfung für harten Fall-Reset (Issue #133):
-            # (a) Dateityp bereits geladen, (b) Chat-Verlauf existiert, (c) Klientenkonflikt
+            # (a) Dateityp bereits geladen, (b) Chat-Verlauf existiert, (c) sicher erkannter Klientenkonflikt
             has_same_type = bot.has_csv
             has_history = len(bot.messages) > 0
-            plan_client = getattr(bot.plan_data, "client_name", "") if bot.plan_data else ""
             client_conflict = False
-            effective_csv_client = client_name if client_name != "Klient*in (anonymisiert)" else detected_client
-            if plan_client and effective_csv_client:
-                p_norm = plan_client.strip().lower()
-                d_norm = effective_csv_client.strip().lower()
-                generic = {"klient*in (anonymisiert)", "klient*in", "anonymisiert", "synthetischer klient", ""}
-                if p_norm not in generic and d_norm not in generic:
-                    if p_norm != d_norm and p_norm not in d_norm and d_norm not in p_norm:
-                        client_conflict = True
+            if bot.plan_data is not None:
+                plan_client = getattr(bot.plan_data, "client_name", "")
+                plan_from_fn = bool(getattr(bot.plan_data, "client_name_from_filename", False))
+                effective_csv_client = client_name if client_name != "Klient*in (anonymisiert)" else detected_client
+                csv_from_fn = bool(getattr(parsed_csv, "client_name_from_filename", False))
+                client_conflict, warning = _evaluate_client_match(
+                    plan_client, plan_from_fn, effective_csv_client, csv_from_fn
+                )
 
             if has_same_type or has_history or client_conflict:
                 return JSONResponse(
@@ -232,7 +291,7 @@ def create_app(
         # Erste 3 Zeilen als Vorschau für die UI
         preview_lines = parsed_csv.to_context_text(max_rows=3, update_counters=False)
 
-        return {
+        resp_payload: Dict[str, Any] = {
             "success": True,
             "filename": parsed_csv.filename,
             "total_rows": parsed_csv.total_rows,
@@ -244,6 +303,9 @@ def create_app(
             "client_name": client_name,
             "source": source,
         }
+        if warning:
+            resp_payload["warning"] = warning
+        return resp_payload
 
     @app.post("/api/upload-plan")
     async def upload_plan(
@@ -297,15 +359,17 @@ def create_app(
 
             detected_plan_client = extract_client_name_from_filename(file.filename)
             effective_plan_client = parsed_plan.client_name or detected_plan_client
-            csv_client = getattr(bot.csv_data, "client_name", "") if bot.csv_data else ""
+            plan_from_fn = bool(
+                getattr(parsed_plan, "client_name_from_filename", False) or not parsed_plan.client_name
+            )
             client_conflict = False
-            if csv_client and effective_plan_client:
-                c_norm = csv_client.strip().lower()
-                p_norm = effective_plan_client.strip().lower()
-                generic = {"klient*in (anonymisiert)", "klient*in", "anonymisiert", "synthetischer klient", ""}
-                if c_norm not in generic and p_norm not in generic:
-                    if c_norm != p_norm and c_norm not in p_norm and p_norm not in c_norm:
-                        client_conflict = True
+            warning = ""
+            if bot.csv_data is not None:
+                csv_client = getattr(bot.csv_data, "client_name", "")
+                csv_from_fn = bool(getattr(bot.csv_data, "client_name_from_filename", False))
+                client_conflict, warning = _evaluate_client_match(
+                    csv_client, csv_from_fn, effective_plan_client, plan_from_fn
+                )
 
             if not new_case:
                 has_same_type = bot.has_plan
@@ -321,10 +385,35 @@ def create_app(
             else:
                 bot.hard_reset(reason="reset")
 
+            is_odw = bool(
+                getattr(parsed_plan, "template", "") == "op-de-wisch"
+                or any(
+                    getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                    for g in getattr(parsed_plan, "goals", [])
+                )
+                or "op_de_wisch" in parsed_plan.filename.lower()
+                or "op-de-wisch" in parsed_plan.filename.lower()
+                or "fo_svb" in parsed_plan.filename.lower()
+            )
+            template_name = "op-de-wisch" if is_odw else "hamburg"
+            bot.case.template = template_name
             bot.set_plan(parsed_plan)
             log_plan_loaded(goals_count=parsed_plan.goals_count)
 
-            return {
+            area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+            available_areas = [
+                {
+                    "id": s.id,
+                    "title": s.title,
+                    "confirmed": bot.case.is_area_confirmed(s.id),
+                }
+                for s in area_defs
+            ]
+
+            parser_warning = getattr(parsed_plan, "warning", "")
+            combined_warning = f"{parser_warning}\n{warning}" if (parser_warning and warning) else (parser_warning or warning)
+
+            plan_resp: Dict[str, Any] = {
                 "success": True,
                 "has_plan": True,
                 "filename": parsed_plan.filename,
@@ -335,9 +424,12 @@ def create_app(
                 "zeitraum_bis": parsed_plan.zeitraum_bis,
                 "hidden_removed": getattr(parsed_plan, "hidden_removed", 0),
                 "is_fallback": getattr(parsed_plan, "is_fallback", False),
-                "warning": getattr(parsed_plan, "warning", ""),
+                "warning": combined_warning,
                 "parser_source": getattr(parsed_plan, "parser_source", ""),
+                "template": template_name,
+                "available_areas": available_areas,
             }
+            return plan_resp
         elif lower_name.endswith(".txt") or lower_name.endswith(".md"):
             try:
                 content_text = content_bytes.decode("utf-8-sig")
@@ -373,10 +465,33 @@ def create_app(
             else:
                 bot.hard_reset(reason="reset")
 
+            odw_ids = {str(i) for i in range(1, 10)}
+            is_odw = bool(
+                "op de wisch" in content_text.lower()
+                or "op-de-wisch" in file.filename.lower()
+                or "op_de_wisch" in file.filename.lower()
+                or any(getattr(g, "section_id", "") in odw_ids for g in parsed_text_plan.goals)
+            )
+            template_name = "op-de-wisch" if is_odw else "hamburg"
+
             bot.set_plan(parsed_text_plan)
-            bot.set_plan_context(content_text, plan_info={"filename": file.filename, "goals_count": parsed_text_plan.goals_count})
+            bot.set_plan_context(
+                content_text,
+                plan_info={"filename": file.filename, "goals_count": parsed_text_plan.goals_count},
+            )
             bot.plan_data = parsed_text_plan
             log_plan_loaded(goals_count=parsed_text_plan.goals_count)
+            bot.case.template = template_name
+
+            area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+            available_areas = [
+                {
+                    "id": s.id,
+                    "title": s.title,
+                    "confirmed": bot.case.is_area_confirmed(s.id),
+                }
+                for s in area_defs
+            ]
             return {
                 "success": True,
                 "has_plan": True,
@@ -390,13 +505,103 @@ def create_app(
                 "is_fallback": getattr(parsed_text_plan, "is_fallback", True),
                 "warning": getattr(parsed_text_plan, "warning", ""),
                 "parser_source": getattr(parsed_text_plan, "parser_source", "text_plan"),
+                "template": template_name,
+                "available_areas": available_areas,
             }
+
+    def _validate_area_for_template(bereich_id: str) -> None:
+        """Prüft bereich_id gegen die Bereiche der geladenen Vorlage."""
+        is_odw = bool(
+            bot.case.template == "op-de-wisch"
+            or (
+                bot.plan_data
+                and (
+                    getattr(bot.plan_data, "template", "") == "op-de-wisch"
+                    or any(
+                        getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                        for g in getattr(bot.plan_data, "goals", [])
+                    )
+                )
+            )
+        )
+        valid_ids = {
+            s.id for s in (OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS)
+        }
+        if bereich_id not in valid_ids:
+            raise HTTPException(status_code=422, detail="❌ Bereich gehört nicht zur Vorlage")
+
+    @app.get("/api/areas")
+    async def get_areas(template: Optional[str] = None) -> Dict[str, Any]:
+        """Liefert die verfügbaren Lebensbereiche für die aktive oder angefragte Vorlage."""
+        bot.check_ttl()
+        if template:
+            norm = template.strip().lower()
+            is_odw = norm in {"op-de-wisch", "op_de_wisch", "hamburg_op_de_wisch", "odw"}
+            bot.case.template = "op-de-wisch" if is_odw else "hamburg"
+        else:
+            is_odw = bool(
+                bot.case.template == "op-de-wisch"
+                or (
+                    bot.plan_data
+                    and (
+                        getattr(bot.plan_data, "template", "") == "op-de-wisch"
+                        or any(
+                            getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                            for g in getattr(bot.plan_data, "goals", [])
+                        )
+                    )
+                )
+            )
+        area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+        available_areas = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "confirmed": bot.case.is_area_confirmed(s.id),
+            }
+            for s in area_defs
+        ]
+        return {
+            "success": True,
+            "template": "op-de-wisch" if is_odw else "hamburg",
+            "available_areas": available_areas,
+            "areas": available_areas,
+        }
+
+    @app.post("/api/template")
+    async def select_template(req: SelectTemplateRequest) -> Dict[str, Any]:
+        """Wechselt die aktive Berichtsvorlage (hamburg oder op-de-wisch)."""
+        bot.check_ttl()
+        norm = req.template.strip().lower()
+        is_odw = norm in {"op-de-wisch", "op_de_wisch", "hamburg_op_de_wisch", "odw"}
+        template_key = "op-de-wisch" if is_odw else "hamburg"
+        bot.case.template = template_key
+
+        area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+        valid_ids = {s.id for s in area_defs}
+        if bot.selected_bereich_id and bot.selected_bereich_id not in valid_ids:
+            bot.selected_bereich_id = None
+
+        available_areas = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "confirmed": bot.case.is_area_confirmed(s.id),
+            }
+            for s in area_defs
+        ]
+        return {
+            "success": True,
+            "template": template_key,
+            "available_areas": available_areas,
+            "areas": available_areas,
+        }
 
     @app.post("/api/area")
     async def select_area(req: SelectAreaRequest) -> Dict[str, Any]:
         """Wählt den aktiven Lebensbereich für den Fachdialog aus (M5)."""
         bot.check_ttl()
-        _validate_area_compatibility(bot, req.bereich_id)
+        _validate_area_for_template(req.bereich_id)
 
         bot.selected_bereich_id = req.bereich_id
         built = ContextBuilder.build(bot.case, req.bereich_id)
@@ -410,6 +615,18 @@ def create_app(
             built.total_count,
         )
 
+        context_status_data = None
+        if (
+            bot.provider is not None
+            and hasattr(bot.provider, "count_tokens")
+            and callable(getattr(bot.provider, "count_tokens"))
+        ):
+            try:
+                _, cs = bot.fit_context_for_prompt(user_message="", bereich_id=req.bereich_id)
+                context_status_data = cs.to_dict()
+            except Exception:
+                pass
+
         return {
             "success": True,
             "bereich_id": req.bereich_id,
@@ -418,13 +635,14 @@ def create_app(
             "unassigned_count": built.unassigned_count,
             "total_count": built.total_count,
             "confirmed": bot.case.is_area_confirmed(req.bereich_id),
+            "context_status": context_status_data,
         }
 
     @app.get("/api/area/{bereich_id}/review")
     async def review_area(bereich_id: ValidAreaId) -> Dict[str, Any]:
         """Liefert die zugeordneten Verlaufs-Einträge und den Alt-SOB-Teil zur fachlichen Prüfung."""
         bot.check_ttl()
-        _validate_area_compatibility(bot, bereich_id)
+        _validate_area_for_template(bereich_id)
         review_data = ContextBuilder.get_review_data(bot.case, bereich_id)
         logger.info(
             "Bereich zur Prüfung aufgerufen: %s (Doku: %d+%d)",
@@ -441,7 +659,7 @@ def create_app(
     async def review_area_post(req: SelectAreaRequest) -> Dict[str, Any]:
         """Liefert die zugeordneten Verlaufs-Einträge und den Alt-SOB-Teil via POST."""
         bot.check_ttl()
-        _validate_area_compatibility(bot, req.bereich_id)
+        _validate_area_for_template(req.bereich_id)
         review_data = ContextBuilder.get_review_data(bot.case, req.bereich_id)
         logger.info(
             "Bereich zur Prüfung aufgerufen: %s (Doku: %d+%d)",
@@ -458,7 +676,7 @@ def create_app(
     async def confirm_area(req: SelectAreaRequest) -> Dict[str, Any]:
         """Setzt die fachliche Bestätigung 'Bereich geprüft' im RAM (Legal 1)."""
         bot.check_ttl()
-        _validate_area_compatibility(bot, req.bereich_id)
+        _validate_area_for_template(req.bereich_id)
         bot.case.confirm_area(req.bereich_id)
         logger.info("Lebensbereich bestätigt: %s", req.bereich_id)
         return {
@@ -471,6 +689,18 @@ def create_app(
     async def chat_stream(req: ChatMessageRequest):
         """Streamt die Modellantwort Token für Token via Server-Sent Events (SSE)."""
         bot.check_ttl()
+        if bot.has_plan:
+            if not bot.selected_bereich_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="❌ Bitte zuerst einen Lebensbereich wählen",
+                )
+            if not bot.case.is_area_confirmed(bot.selected_bereich_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="❌ Bitte den Bereich mit „Bereich prüfen“ bestätigen",
+                )
+
         if bot.provider is None:
             reason = bot.model_error or "Modelldatei fehlt"
             raise HTTPException(status_code=503, detail=f"❌ Kein Modell geladen: {reason}")
@@ -485,7 +715,10 @@ def create_app(
                     yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
                     return
                 yield f"data: {json.dumps({'token': item}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'done': True, 'model': bot.model_info}, ensure_ascii=False)}\n\n"
+            done_payload: Dict[str, Any] = {"done": True, "model": bot.model_info}
+            if getattr(bot, "last_context_status", None):
+                done_payload["context_status"] = bot.last_context_status.to_dict()
+            yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(
             event_generator(),
@@ -769,10 +1002,16 @@ def create_app(
             }
 
         is_odw = bool(
-            bot.plan_data
-            and any(
-                getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                for g in getattr(bot.plan_data, "goals", [])
+            bot.case.template == "op-de-wisch"
+            or (
+                bot.plan_data
+                and (
+                    getattr(bot.plan_data, "template", "") == "op-de-wisch"
+                    or any(
+                        getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                        for g in getattr(bot.plan_data, "goals", [])
+                    )
+                )
             )
         )
         area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
@@ -784,6 +1023,23 @@ def create_app(
             }
             for s in area_defs
         ]
+        template_name = "op-de-wisch" if is_odw else "hamburg"
+
+        context_status_data = None
+        if (
+            bot.selected_bereich_id
+            and bot.provider is not None
+            and hasattr(bot.provider, "count_tokens")
+            and callable(getattr(bot.provider, "count_tokens"))
+        ):
+            try:
+                _, cs = bot.fit_context_for_prompt(user_message="", bereich_id=bot.selected_bereich_id)
+                context_status_data = cs.to_dict()
+            except Exception:
+                if getattr(bot, "last_context_status", None):
+                    context_status_data = bot.last_context_status.to_dict()
+        elif getattr(bot, "last_context_status", None):
+            context_status_data = bot.last_context_status.to_dict()
 
         return {
             "fall_id": bot.case.fall_id,
@@ -799,8 +1055,10 @@ def create_app(
             "csv": csv_info,
             "plan": plan_info,
             "model": bot.model_info,
+            "template": template_name,
             "selected_area": selected_area_info,
             "available_areas": available_areas,
+            "context_status": context_status_data,
             "messages": bot.get_history(),
         }
 

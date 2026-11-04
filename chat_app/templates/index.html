@@ -655,6 +655,14 @@
       border-bottom-left-radius: 2px;
     }
 
+    .message.error {
+      align-self: flex-start;
+      background-color: rgba(239, 68, 68, 0.12);
+      border: 1px solid #ef4444;
+      color: #fca5a5;
+      border-bottom-left-radius: 2px;
+    }
+
     .message-header {
       display: flex;
       justify-content: space-between;
@@ -767,6 +775,34 @@
       opacity: 0.5;
       cursor: not-allowed;
       pointer-events: none;
+    }
+
+    .budget-status-strip {
+      padding: 6px 24px;
+      background: #0b1120;
+      border-top: 1px solid var(--card-border);
+      font-size: 0.78rem;
+      color: #94a3b8;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .budget-warning-container {
+      padding: 6px 24px;
+      background: rgba(245, 158, 11, 0.08);
+      border-top: 1px solid rgba(245, 158, 11, 0.25);
+      font-size: 0.78rem;
+      color: #fbbf24;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .budget-warning-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .input-bar {
@@ -967,7 +1003,7 @@
         <option value="">Modelle werden geladen...</option>
       </select>
       <button class="btn btn-outline" onclick="copyChatHistory()" title="Vollständigen Chatverlauf in die Zwischenablage kopieren">📋 Verlauf kopieren</button>
-      <select id="exportTemplateSelect" class="model-select" style="padding: 6px 10px; font-size: 0.85rem;" title="Vorlage für Word-Export wählen">
+      <select id="exportTemplateSelect" class="model-select" onchange="handleTemplateChange(this.value)" style="padding: 6px 10px; font-size: 0.85rem;" title="Vorlage für Word-Export wählen">
         <option value="hamburg">Hamburg — Fachamt</option>
         <option value="op-de-wisch">Op de Wisch</option>
       </select>
@@ -1152,6 +1188,12 @@
           onclick="sendQuickPrompt('Wie stellt sich die Situation und Entwicklung aus der Perspektive der/des Klient*in dar? Welche Wünsche, Motive und Hürden stehen im Vordergrund?')"
           title="Klientenperspektive einnehmen"
         >👤 Klientenperspektive einnehmen</button>
+      </div>
+
+      <!-- Status-Streifen und ⚠️-Hinweise über dem Eingabefeld (Issue #17) -->
+      <div id="budgetWarningContainer" class="budget-warning-container" style="display: none;"></div>
+      <div id="budgetStatusStrip" class="budget-status-strip" style="display: none;">
+        <span id="budgetStatusText"></span>
       </div>
 
       <!-- Eingabezeile -->
@@ -1386,6 +1428,7 @@
         if (planCard && planCard.classList.contains('visible')) {
           planCardMeta.textContent = `${currentPlanGoalsCount} Bereiche erkannt`;
         }
+        updateBudgetUI(null);
         updateChatLockState();
         renderFilteredMessages();
         return;
@@ -1430,6 +1473,9 @@
         updateChatLockState();
         renderFilteredMessages();
         appendSystemNotification(`🎯 Arbeitsbereich: ${data.bereich_id} (${data.title})`);
+        if (data.context_status) {
+          updateBudgetUI(data.context_status);
+        }
       } catch (err) {
         showModalError("Verbindungsfehler", err.message);
       }
@@ -1620,6 +1666,56 @@
       }
     }
 
+    function updateBudgetUI(status) {
+      const strip = document.getElementById('budgetStatusStrip');
+      const textSpan = document.getElementById('budgetStatusText');
+      const warningBox = document.getElementById('budgetWarningContainer');
+      if (!strip || !textSpan || !warningBox) return;
+
+      if (!status || !status.bereich_id) {
+        strip.style.display = 'none';
+        warningBox.style.display = 'none';
+        return;
+      }
+
+      // Status-Streifen: "Bereich 3 · Vorbericht vollständig · Doku 7+12 Einträge · Kontext 6.210/16.384"
+      const vbStatus = status.vorbericht_complete ? "Vorbericht vollständig" : "Vorbericht gekürzt";
+      const assigned = Math.max(0, (status.entries_kept || 0) - (status.unassigned_kept || 0));
+      const unassigned = status.unassigned_kept || 0;
+      const dokuPart = `Doku ${assigned}+${unassigned} Einträge`;
+      const tokensPart = `Kontext ${(status.tokens_used || 0).toLocaleString('de-DE')}/${(status.n_ctx || 16384).toLocaleString('de-DE')}`;
+
+      textSpan.textContent = `Bereich ${status.bereich_id} · ${vbStatus} · ${dokuPart} · ${tokensPart}`;
+      strip.style.display = 'flex';
+
+      // ⚠️ notices (not in messages, not in export)
+      const notices = [];
+      if (!status.vorbericht_complete && status.sentences_total > 0) {
+        notices.push(`Bericht Bereich ${status.bereich_id} gekürzt: ${status.sentences_kept} von ${status.sentences_total} Sätzen im Kontext`);
+      }
+      if (status.entries_kept < status.entries_total) {
+        const dateInfo = status.oldest_included_date ? ` (ältere bis ${status.oldest_included_date} nicht)` : '';
+        notices.push(`Verlaufsdoku Bereich ${status.bereich_id}: ${status.entries_kept} von ${status.entries_total} Einträgen im Kontext${dateInfo}`);
+      }
+      if (status.dropped_messages > 0) {
+        notices.push(`${status.dropped_messages} ältere Nachrichten nicht mehr im Modellkontext (bleiben im Export)`);
+      }
+
+      if (notices.length > 0) {
+        warningBox.innerHTML = '';
+        notices.forEach(n => {
+          const item = document.createElement('div');
+          item.className = 'budget-warning-item';
+          item.textContent = `⚠️ ${n}`;
+          warningBox.appendChild(item);
+        });
+        warningBox.style.display = 'flex';
+      } else {
+        warningBox.style.display = 'none';
+        warningBox.innerHTML = '';
+      }
+    }
+
     function renderFilteredMessages() {
       messagesContainer.innerHTML = '';
       chatScroll.resume();
@@ -1640,6 +1736,8 @@
       msgsToRender.forEach(m => {
         if (m.role === 'user') {
           appendUserMessage(m.content);
+        } else if (m.role === 'error') {
+          appendErrorMessage(m.content);
         } else {
           const bubble = createAssistantMessageBubble();
           bubble.contentDiv.innerHTML = formatMarkdown(m.content);
@@ -1841,6 +1939,10 @@
         appendSystemNotification(
           `✅ CSV '${data.filename}' erfolgreich geladen${notifCount}`
         );
+        if (data.warning) {
+          appendSystemNotification(data.warning);
+          showToast(data.warning);
+        }
       } catch (err) {
         const errMsg = setUploadBannerError('csvUploadError', err.message);
         showModalError("Upload fehlgeschlagen", errMsg);
@@ -1984,11 +2086,37 @@
         const period = (data.zeitraum_von || data.zeitraum_bis)
           ? `${data.zeitraum_von || ''} bis ${data.zeitraum_bis || ''}`.trim()
           : (data.zeitraum || '');
-        updatePlanUI(data.filename, data.goals_count, data.client_name, data.preview, period, data.hidden_removed, data.warning, data.is_fallback);
+        updatePlanUI(
+          data.filename,
+          data.goals_count,
+          data.client_name,
+          data.preview,
+          period,
+          data.hidden_removed,
+          data.warning,
+          data.is_fallback
+        );
+        if (data.template) {
+          const templateSelect = document.getElementById('exportTemplateSelect');
+          if (templateSelect) {
+            templateSelect.value = data.template;
+          }
+        }
+        if (data.available_areas) {
+          currentSelectedAreaId = null;
+          populateAreaSelect(data.available_areas, null);
+          if (areaCounters) areaCounters.style.display = 'none';
+          updateConfirmButtonState(false);
+        }
         appendSystemNotification(
           `✅ Vorbericht '${data.filename}' erfolgreich geladen (${data.goals_count} Ziele aktiv)`
         );
-        showToast(`✓ Vorbericht geladen: ${data.filename}`);
+        if (data.warning) {
+          appendSystemNotification(data.warning);
+          showToast(data.warning);
+        } else {
+          showToast(`✓ Vorbericht geladen: ${data.filename}`);
+        }
       } catch (err) {
         const errMsg = setUploadBannerError('planUploadError', err.message);
         showModalError("Upload fehlgeschlagen", errMsg);
@@ -2132,6 +2260,28 @@
       return { msgDiv, contentDiv };
     }
 
+    function appendErrorMessage(text) {
+      if (emptyState) emptyState.style.display = 'none';
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'message error';
+
+      const header = document.createElement('div');
+      header.className = 'message-header';
+      header.style.color = '#ef4444';
+      header.innerHTML = '<span>System-Hinweis</span>';
+      msgDiv.appendChild(header);
+
+      const contentNode = document.createElement('div');
+      contentNode.className = 'content';
+      contentNode.style.color = '#fca5a5';
+      contentNode.textContent = text;
+      msgDiv.appendChild(contentNode);
+
+      messagesContainer.appendChild(msgDiv);
+      chatScroll.follow();
+      return msgDiv;
+    }
+
     function createChatScroll(container) {
       let following = true;
       let frame = null;
@@ -2256,13 +2406,22 @@
         });
 
         if (!response.ok) {
-          if (response.status === 503) {
-            const errData = await response.json().catch(() => ({}));
-            contentDiv.closest('.message')?.remove();
-            showModalError("Kein Modell geladen", errData.detail || "Kein Modell geladen.");
-            return;
+          const errData = await response.json().catch(() => ({}));
+          contentDiv.closest('.message')?.remove();
+          let detail = errData.detail;
+          if (Array.isArray(detail)) {
+            detail = detail.map(d => (d && d.msg) ? d.msg : JSON.stringify(d)).join("; ");
+          } else if (typeof detail === 'object' && detail !== null) {
+            detail = detail.msg || detail.message || JSON.stringify(detail);
           }
-          throw new Error("HTTP Fehler " + response.status);
+          const fallbackMsg = response.status === 503 ? "Kein Modell geladen." : `HTTP Fehler ${response.status}`;
+          let errorText = detail || fallbackMsg;
+          if (!errorText.startsWith('❌')) {
+            errorText = `❌ ${errorText}`;
+          }
+          appendErrorMessage(errorText);
+          allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
+          return;
         }
 
         const reader = response.body.getReader();
@@ -2284,13 +2443,19 @@
                 const data = JSON.parse(jsonStr);
                 if (data.error) {
                   contentDiv.closest('.message')?.remove();
-                  showModalError("Fehler bei der Modell-Generierung", data.error);
+                  let errStr = String(data.error);
+                  if (!errStr.startsWith('❌')) {
+                    errStr = `❌ ${errStr}`;
+                  }
+                  appendErrorMessage(errStr);
+                  allSessionMessages.push({ role: 'error', content: errStr, bereich_id: currentSelectedAreaId });
                   return;
                 }
                 if (data.token) {
                   streamingMessage.append(data.token);
                 } else if (data.done) {
                   if (data.model) updateModelUI(data.model);
+                  if (data.context_status) updateBudgetUI(data.context_status);
                 }
               } catch (e) {
                 console.error("JSON Parse Error:", e, jsonStr);
@@ -2304,7 +2469,9 @@
 
       } catch (err) {
         contentDiv.closest('.message')?.remove();
-        showModalError("Kommunikationsfehler", err.message);
+        const errorText = `❌ Kommunikationsfehler: ${err.message}`;
+        appendErrorMessage(errorText);
+        allSessionMessages.push({ role: 'error', content: errorText, bereich_id: currentSelectedAreaId });
       } finally {
         isGenerating = false;
         chatScroll.follow();
@@ -2598,6 +2765,27 @@
       }
     }
 
+    async function handleTemplateChange(templateVal) {
+      if (!templateVal) return;
+      try {
+        const res = await fetch(`/api/areas?template=${encodeURIComponent(templateVal)}`);
+        if (res.ok) {
+          const data = await res.json();
+          const areas = data.available_areas || data.areas;
+          currentSelectedAreaId = null;
+          populateAreaSelect(areas, null);
+          if (areaCounters) areaCounters.style.display = 'none';
+          updateConfirmButtonState(false);
+          updateChatLockState();
+          showToast(`Vorlage gewechselt: ${templateVal === 'op-de-wisch' ? 'Op de Wisch' : 'Hamburg'}`);
+        } else {
+          showModalError("Fehler beim Vorlagenwechsel", `HTTP ${res.status}`);
+        }
+      } catch (err) {
+        showModalError("Fehler beim Vorlagenwechsel", err.message);
+      }
+    }
+
     async function handleModelChange(modelName) {
       if (!modelName) return;
       if (isGenerating) {
@@ -2776,6 +2964,12 @@
             data.plan.is_fallback
           );
         }
+        if (data.template) {
+          const templateSelect = document.getElementById('exportTemplateSelect');
+          if (templateSelect) {
+            templateSelect.value = data.template;
+          }
+        }
         if (data.available_areas) {
           populateAreaSelect(data.available_areas, data.selected_area ? data.selected_area.id : null);
         }
@@ -2809,6 +3003,10 @@
           renderFilteredMessages();
         } else {
           allSessionMessages = [];
+        }
+
+        if (data.context_status) {
+          updateBudgetUI(data.context_status);
         }
       } catch (e) {
         console.error("Fehler beim Abrufen der Session:", e);

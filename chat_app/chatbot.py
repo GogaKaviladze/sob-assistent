@@ -708,8 +708,7 @@ class ReflectionChatbot:
     @template.setter
     def template(self, value: str) -> None:
         with self._lock:
-            self.case.template = value
-            self.touch()
+            self.case.set_template(value, selected=True)
 
     def touch(self) -> None:
         """Aktualisiert die letzte Fall-Aktivität."""

@@ -300,6 +300,8 @@ def create_app(
         source = "Vivendi PD Verlaufsbericht" if is_vivendi else f"Verlaufsdokumentation ({file.filename})"
 
         warning = ""
+        was_selected = bool(getattr(bot.case, "template_selected", False))
+        selected_template = bot.case.template
         if not new_case:
             # Konfliktprüfung für harten Fall-Reset (Issue #133):
             # (a) Dateityp bereits geladen, (b) Chat-Verlauf existiert, (c) sicher erkannter Klientenkonflikt
@@ -325,6 +327,8 @@ def create_app(
                 )
         else:
             bot.hard_reset(reason="reset")
+            if was_selected:
+                bot.case.set_template(selected_template, selected=True)
 
         bot.set_csv(parsed_csv)
         log_csv_loaded(total_rows=parsed_csv.entries_total, columns_count=len(parsed_csv.headers))
@@ -428,6 +432,9 @@ def create_app(
                     csv_client, csv_from_fn, effective_plan_client, plan_from_fn
                 )
 
+            was_selected = bool(getattr(bot.case, "template_selected", False))
+            selected_template = bot.case.template
+
             if not new_case:
                 has_same_type = bot.has_plan
                 has_history = len(bot.messages) > 0
@@ -441,8 +448,9 @@ def create_app(
                     )
             else:
                 bot.hard_reset(reason="reset")
+                if was_selected:
+                    bot.case.set_template(selected_template, selected=True)
 
-            was_selected = bool(getattr(bot.case, "template_selected", False))
             template_source = "gewaehlt" if was_selected else "erkannt"
             bot.case.set_template(template_name, selected=was_selected)
             bot.set_plan(parsed_plan)
@@ -520,6 +528,9 @@ def create_app(
             if mismatch_resp is not None:
                 return mismatch_resp
 
+            was_selected = bool(getattr(bot.case, "template_selected", False))
+            selected_template = bot.case.template
+
             if not new_case:
                 has_same_type = bot.has_plan
                 has_history = len(bot.messages) > 0
@@ -533,8 +544,9 @@ def create_app(
                     )
             else:
                 bot.hard_reset(reason="reset")
+                if was_selected:
+                    bot.case.set_template(selected_template, selected=True)
 
-            was_selected = bool(getattr(bot.case, "template_selected", False))
             template_source = "gewaehlt" if was_selected else "erkannt"
             bot.case.set_template(template_name, selected=was_selected)
             bot.set_plan(parsed_text_plan)
@@ -544,7 +556,6 @@ def create_app(
             )
             bot.plan_data = parsed_text_plan
             log_plan_loaded(goals_count=parsed_text_plan.goals_count)
-            bot.case.set_template(template_name, selected=was_selected)
 
             area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
             available_areas = [
@@ -584,14 +595,15 @@ def create_app(
 
     @app.get("/api/areas")
     async def get_areas(template: Optional[str] = None) -> Dict[str, Any]:
-        """Liefert die verfügbaren Lebensbereiche für die aktive oder angefragte Vorlage."""
+        """Liefert die verfügbaren Lebensbereiche für die aktive oder angefragte Vorlage (nur lesend)."""
         bot.check_ttl()
         if template:
             template_key = _normalize_template(template)
-            bot.case.set_template(template_key, selected=True)
             is_odw = template_key == "op-de-wisch"
+            tpl_name = template_key
         else:
             is_odw = ContextBuilder.is_odw_case(bot.case)
+            tpl_name = "op-de-wisch" if is_odw else "hamburg"
         area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
         available_areas = [
             {
@@ -603,7 +615,7 @@ def create_app(
         ]
         return {
             "success": True,
-            "template": "op-de-wisch" if is_odw else "hamburg",
+            "template": tpl_name,
             "available_areas": available_areas,
             "areas": available_areas,
         }
@@ -846,7 +858,6 @@ def create_app(
         bot.set_plan(parsed_text_plan)
         bot.set_plan_context(req.plan_text, plan_info=info)
         bot.plan_data = parsed_text_plan
-        bot.case.set_template(template_name, selected=was_selected)
         return {
             "success": True,
             "has_plan": True,

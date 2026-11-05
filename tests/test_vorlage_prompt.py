@@ -618,3 +618,205 @@ def test_hamburg_system_prompt_and_payload_unchanged():
     assert "3 Beschäftigung, Arbeit, Ausbildung" in sys_content
     assert '<vorbericht_bereich id="1.4">' in combined
     assert "Psychische Verfassung / Selbstsorge" not in sys_content
+
+
+# ===========================================================================
+# Ergänzende Tests (Issue #34 PR #35 Should-Fixes & Nits)
+# ===========================================================================
+
+
+def test_odw_area_7_prompt_and_payload_correct_without_hamburg_names():
+    """Test: Bei Op de Wisch ist Bereich 7 im Prompt korrekt, ohne Hamburg-Bezeichnungen."""
+    provider = RecordingMockLLM(
+        reply="### Bereich 7 – Arbeit / Beschäftigung / Ausbildung\n**Bisherige Zielerreichung:**\nSynthetisch."
+    )
+    bot = ReflectionChatbot(provider=provider)
+    client = TestClient(create_app(chatbot=bot))
+
+    client.post("/api/template", json={"template": "op-de-wisch"})
+    odw_bytes = build_opdewisch_vorbericht(client_name="Mustermann", client_vorname="Max")
+    r_plan = client.post(
+        "/api/upload-plan",
+        files={"file": ("Vorbericht_Mustermann.docx", io.BytesIO(odw_bytes), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert r_plan.status_code == 200
+
+    bot.set_csv(parse_csv_content(SYNTHETIC_CSV_CONTENT, filename="verlauf_synth.csv", client_name="Max Mustermann"))
+
+    r_area = client.post("/api/area", json={"bereich_id": "7"})
+    assert r_area.status_code == 200
+    assert r_area.json()["title"] == "Arbeit / Beschäftigung / Ausbildung"
+
+    client.post("/api/area/confirm", json={"bereich_id": "7"})
+
+    payload_msgs = bot._build_payload(bereich_id="7")
+    fit_msgs, _ = bot.fit_context_for_prompt(
+        user_message="Wie entwickelt sich Bereich 7?",
+        bereich_id="7",
+    )
+
+    with client.stream(
+        "POST",
+        "/api/chat-stream",
+        json={"message": "Wie entwickelt sich Bereich 7?"},
+    ) as stream_res:
+        assert stream_res.status_code == 200
+        _ = "".join(stream_res.iter_text())
+
+    sent_msgs = provider.last_messages
+    assert len(sent_msgs) >= 2
+
+    for msg_list in (payload_msgs, fit_msgs, sent_msgs):
+        sys_msg = msg_list[0]
+        assert sys_msg["role"] == "system"
+        sys_content = sys_msg["content"]
+        combined_content = "\n".join(m.get("content", "") for m in msg_list)
+
+        # Bereich 7 muss im System-Prompt und Kontext korrekt stehen
+        assert "7 Arbeit / Beschäftigung / Ausbildung" in sys_content
+        assert '<vorbericht_bereich id="7">' in combined_content
+        assert "Arbeit / Beschäftigung / Ausbildung" in combined_content
+        assert "ZZ_SYNTH_ODW_7_LEITZIEL" in combined_content
+
+        # Keine Hamburg-Dotted-IDs
+        for hh_id in HAMBURG_DOTTED_IDS:
+            pattern = rf"(?<![\d.]){re.escape(hh_id)}(?![\d.])"
+            assert not re.search(pattern, sys_content)
+            assert not re.search(pattern, combined_content)
+
+        # Keine Hamburg-Bereichstitel (insbesondere nicht Hamburgs Bereich 3 "Beschäftigung, Arbeit, Ausbildung")
+        assert "Beschäftigung, Arbeit, Ausbildung" not in sys_content
+        assert "Beschäftigung, Arbeit, Ausbildung" not in combined_content
+        assert "1.4 Emotionale und psychische Entwicklung" not in combined_content
+
+
+def test_upload_new_case_preserves_selected_template():
+    """Test: new_case=true behält die gewählte Vorlage, template_source bleibt 'gewaehlt'."""
+    bot = ReflectionChatbot(provider=RecordingMockLLM())
+    client = TestClient(create_app(chatbot=bot))
+
+    # 1. Vorlage vor dem Upload explizit wählen
+    r_tpl = client.post("/api/template", json={"template": "op-de-wisch"})
+    assert r_tpl.status_code == 200
+    assert bot.case.template == "op-de-wisch"
+    assert bot.case.template_selected is True
+
+    # 2. Upload eines Vorberichts mit new_case=True
+    odw_bytes = build_opdewisch_vorbericht(client_name="Mustermann", client_vorname="Max")
+    res_plan = client.post(
+        "/api/upload-plan",
+        files={"file": ("Vorbericht_Mustermann.docx", io.BytesIO(odw_bytes), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        data={"new_case": "true"},
+    )
+    assert res_plan.status_code == 200
+    data = res_plan.json()
+    assert data["template"] == "op-de-wisch"
+    assert data["template_source"] == "gewaehlt", (
+        f"Erwartet 'gewaehlt', aber erhalten: {data.get('template_source')}"
+    )
+
+    # 3. Session-State prüfen: template_selected muss True bleiben
+    assert bot.case.template == "op-de-wisch"
+    assert bot.case.template_selected is True
+
+    r_session = client.get("/api/session")
+    assert r_session.status_code == 200
+    assert r_session.json()["template"] == "op-de-wisch"
+    assert r_session.json()["template_selected"] is True
+
+
+def test_upload_txt_plan_new_case_preserves_selected_template():
+    """Test: Text-Vorbericht mit new_case=true behält ebenfalls die explizite Vorlagenwahl."""
+    bot = ReflectionChatbot(provider=RecordingMockLLM())
+    client = TestClient(create_app(chatbot=bot))
+
+    client.post("/api/template", json={"template": "op-de-wisch"})
+    assert bot.case.template == "op-de-wisch"
+    assert bot.case.template_selected is True
+
+    plan_txt = "Bereich 1: Psychische Verfassung\nLeitziel: Synthetisch\nBereich 2: Alltagsgestaltung\nLeitziel: Synthetisch"
+    res_txt = client.post(
+        "/api/upload-plan",
+        files={"file": ("vorbericht_odw.txt", io.BytesIO(plan_txt.encode("utf-8")), "text/plain")},
+        data={"new_case": "true"},
+    )
+    assert res_txt.status_code == 200
+    data = res_txt.json()
+    assert data["template"] == "op-de-wisch"
+    assert data["template_source"] == "gewaehlt"
+    assert bot.case.template == "op-de-wisch"
+    assert bot.case.template_selected is True
+
+
+def test_get_areas_with_template_query_does_not_mutate_session_state():
+    """Test: GET /api/areas?template= ändert den Session-State nicht (nur lesend)."""
+    bot = ReflectionChatbot(provider=RecordingMockLLM())
+    client = TestClient(create_app(chatbot=bot))
+
+    # Fall A: Ausgangszustand ist ohne Vorwahl (Default hamburg, template_selected=False)
+    assert bot.case.template == "hamburg"
+    assert bot.case.template_selected is False
+
+    r_areas_odw = client.get("/api/areas?template=op-de-wisch")
+    assert r_areas_odw.status_code == 200
+    assert r_areas_odw.json()["template"] == "op-de-wisch"
+    assert len(r_areas_odw.json()["available_areas"]) == 9
+
+    # State darf NICHT verändert worden sein
+    assert bot.case.template == "hamburg"
+    assert bot.case.template_selected is False
+
+    # Ein folgender Hamburg-Vorbericht-Upload darf daher KEINEN 422 Mismatch erzeugen
+    hh_bytes = build_hamburg_vorbericht()
+    r_hh = client.post(
+        "/api/upload-plan",
+        files={"file": ("Vorbericht_HH.docx", io.BytesIO(hh_bytes), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert r_hh.status_code == 200
+    assert r_hh.json()["template"] == "hamburg"
+
+    # Fall B: Fachkraft wählt explizit op-de-wisch
+    client.post("/api/template", json={"template": "op-de-wisch"})
+    assert bot.case.template == "op-de-wisch"
+    assert bot.case.template_selected is True
+
+    # GET /api/areas?template=hamburg aufrufen
+    r_areas_hh = client.get("/api/areas?template=hamburg")
+    assert r_areas_hh.status_code == 200
+    assert r_areas_hh.json()["template"] == "hamburg"
+
+    # State muss weiterhin op-de-wisch / template_selected=True sein
+    assert bot.case.template == "op-de-wisch"
+    assert bot.case.template_selected is True
+
+    # Ein Op-de-Wisch-Upload muss weiterhin erfolgreich sein (kein Mismatch)
+    odw_bytes = build_opdewisch_vorbericht()
+    r_odw = client.post(
+        "/api/upload-plan",
+        files={"file": ("Vorbericht_ODW.docx", io.BytesIO(odw_bytes), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        data={"new_case": "true"},
+    )
+    assert r_odw.status_code == 200
+    assert r_odw.json()["template"] == "op-de-wisch"
+    assert r_odw.json()["template_source"] == "gewaehlt"
+
+
+def test_case_template_direct_assignment_does_not_set_selected():
+    """Test: Direkte Zuweisung case.template mutiert template_selected nicht heimlich; nur set_template."""
+    from chat_app.case import CaseSession
+
+    session = CaseSession()
+    assert session.template == "hamburg"
+    assert session.template_selected is False
+
+    # Direkte Zuweisung
+    session.template = "op-de-wisch"
+    assert session.template == "op-de-wisch"
+    assert session.template_selected is False, (
+        "Direkte Attributzuweisung darf template_selected nicht implizit auf True setzen"
+    )
+
+    # Explizite Wahl über set_template
+    session.set_template("op-de-wisch", selected=True)
+    assert session.template_selected is True
+

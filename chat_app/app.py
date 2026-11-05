@@ -199,6 +199,47 @@ def create_app(
 
     bot = chatbot or ReflectionChatbot()
 
+    _template_labels = {
+        "hamburg": "Hamburg",
+        "op-de-wisch": "Op de Wisch",
+    }
+
+    def _normalize_template(raw: str) -> str:
+        norm = (raw or "").strip().lower()
+        if norm in {"hamburg", "hh", "hamburger", "hamburg_svb"}:
+            return "hamburg"
+        if norm in {"op-de-wisch", "op_de_wisch", "hamburg_op_de_wisch", "odw", "opdewisch"}:
+            return "op-de-wisch"
+        raise HTTPException(
+            status_code=422,
+            detail="❌ Ungültige Vorlage – bitte 'Hamburg' oder 'Op de Wisch' wählen.",
+        )
+
+    def _check_template_mismatch(detected_template: str) -> Optional[JSONResponse]:
+        """Prüft, ob der erkannte Vorbericht-Typ von der durch die Fachkraft gewählten Vorlage abweicht."""
+        if getattr(bot.case, "template_selected", False) and detected_template != bot.case.template:
+            det_label = _template_labels.get(detected_template, detected_template)
+            chosen_label = _template_labels.get(bot.case.template, bot.case.template)
+            msg = (
+                f"❌ Vorbericht sieht nach {det_label} aus, "
+                f"gewählt ist {chosen_label} – bitte Vorlage prüfen"
+            )
+            logger.warning(
+                "Vorbericht-Upload abgelehnt wegen Vorlagen-Abweichung: erkannt=%s, gewaehlt=%s",
+                detected_template,
+                bot.case.template,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": msg,
+                    "error": msg,
+                    "template": bot.case.template,
+                    "detected_template": detected_template,
+                },
+            )
+        return None
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         """Liefert die interaktive Benutzeroberfläche aus."""
@@ -259,6 +300,8 @@ def create_app(
         source = "Vivendi PD Verlaufsbericht" if is_vivendi else f"Verlaufsdokumentation ({file.filename})"
 
         warning = ""
+        was_selected = bool(getattr(bot.case, "template_selected", False))
+        selected_template = bot.case.template
         if not new_case:
             # Konfliktprüfung für harten Fall-Reset (Issue #133):
             # (a) Dateityp bereits geladen, (b) Chat-Verlauf existiert, (c) sicher erkannter Klientenkonflikt
@@ -284,6 +327,8 @@ def create_app(
                 )
         else:
             bot.hard_reset(reason="reset")
+            if was_selected:
+                bot.case.set_template(selected_template, selected=True)
 
         bot.set_csv(parsed_csv)
         log_csv_loaded(total_rows=parsed_csv.entries_total, columns_count=len(parsed_csv.headers))
@@ -357,6 +402,22 @@ def create_app(
                     detail="❌ Kein gültiger Vorbericht erkannt: Es konnten keine Lebensbereiche oder Ziele extrahiert werden. Bitte Vorlage prüfen (Hamburger SVB oder Op de Wisch).",
                 )
 
+            is_odw = bool(
+                getattr(parsed_plan, "template", "") == "op-de-wisch"
+                or any(
+                    getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
+                    for g in getattr(parsed_plan, "goals", [])
+                )
+                or "op_de_wisch" in parsed_plan.filename.lower()
+                or "op-de-wisch" in parsed_plan.filename.lower()
+                or "fo_svb" in parsed_plan.filename.lower()
+            )
+            template_name = "op-de-wisch" if is_odw else "hamburg"
+
+            mismatch_resp = _check_template_mismatch(template_name)
+            if mismatch_resp is not None:
+                return mismatch_resp
+
             detected_plan_client = extract_client_name_from_filename(file.filename)
             effective_plan_client = parsed_plan.client_name or detected_plan_client
             plan_from_fn = bool(
@@ -371,6 +432,9 @@ def create_app(
                     csv_client, csv_from_fn, effective_plan_client, plan_from_fn
                 )
 
+            was_selected = bool(getattr(bot.case, "template_selected", False))
+            selected_template = bot.case.template
+
             if not new_case:
                 has_same_type = bot.has_plan
                 has_history = len(bot.messages) > 0
@@ -384,19 +448,11 @@ def create_app(
                     )
             else:
                 bot.hard_reset(reason="reset")
+                if was_selected:
+                    bot.case.set_template(selected_template, selected=True)
 
-            is_odw = bool(
-                getattr(parsed_plan, "template", "") == "op-de-wisch"
-                or any(
-                    getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                    for g in getattr(parsed_plan, "goals", [])
-                )
-                or "op_de_wisch" in parsed_plan.filename.lower()
-                or "op-de-wisch" in parsed_plan.filename.lower()
-                or "fo_svb" in parsed_plan.filename.lower()
-            )
-            template_name = "op-de-wisch" if is_odw else "hamburg"
-            bot.case.template = template_name
+            template_source = "gewaehlt" if was_selected else "erkannt"
+            bot.case.set_template(template_name, selected=was_selected)
             bot.set_plan(parsed_plan)
             log_plan_loaded(goals_count=parsed_plan.goals_count)
 
@@ -427,6 +483,7 @@ def create_app(
                 "warning": combined_warning,
                 "parser_source": getattr(parsed_plan, "parser_source", ""),
                 "template": template_name,
+                "template_source": template_source,
                 "available_areas": available_areas,
             }
             return plan_resp
@@ -451,6 +508,29 @@ def create_app(
                     detail="❌ Kein gültiger Vorbericht erkannt: Es konnten keine Lebensbereiche oder Ziele extrahiert werden.",
                 )
 
+            odw_only_ids = {"1", "2", "4", "5", "6", "7", "8", "9"}
+            has_hamburg_dotted = any("." in getattr(g, "section_id", "") for g in parsed_text_plan.goals)
+            is_odw = bool(
+                getattr(parsed_text_plan, "template", "") == "op-de-wisch"
+                or (
+                    not has_hamburg_dotted
+                    and (
+                        "op de wisch" in content_text.lower()
+                        or "op-de-wisch" in file.filename.lower()
+                        or "op_de_wisch" in file.filename.lower()
+                        or any(getattr(g, "section_id", "") in odw_only_ids for g in parsed_text_plan.goals)
+                    )
+                )
+            )
+            template_name = "op-de-wisch" if is_odw else "hamburg"
+
+            mismatch_resp = _check_template_mismatch(template_name)
+            if mismatch_resp is not None:
+                return mismatch_resp
+
+            was_selected = bool(getattr(bot.case, "template_selected", False))
+            selected_template = bot.case.template
+
             if not new_case:
                 has_same_type = bot.has_plan
                 has_history = len(bot.messages) > 0
@@ -464,16 +544,11 @@ def create_app(
                     )
             else:
                 bot.hard_reset(reason="reset")
+                if was_selected:
+                    bot.case.set_template(selected_template, selected=True)
 
-            odw_ids = {str(i) for i in range(1, 10)}
-            is_odw = bool(
-                "op de wisch" in content_text.lower()
-                or "op-de-wisch" in file.filename.lower()
-                or "op_de_wisch" in file.filename.lower()
-                or any(getattr(g, "section_id", "") in odw_ids for g in parsed_text_plan.goals)
-            )
-            template_name = "op-de-wisch" if is_odw else "hamburg"
-
+            template_source = "gewaehlt" if was_selected else "erkannt"
+            bot.case.set_template(template_name, selected=was_selected)
             bot.set_plan(parsed_text_plan)
             bot.set_plan_context(
                 content_text,
@@ -481,7 +556,6 @@ def create_app(
             )
             bot.plan_data = parsed_text_plan
             log_plan_loaded(goals_count=parsed_text_plan.goals_count)
-            bot.case.template = template_name
 
             area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
             available_areas = [
@@ -506,24 +580,13 @@ def create_app(
                 "warning": getattr(parsed_text_plan, "warning", ""),
                 "parser_source": getattr(parsed_text_plan, "parser_source", "text_plan"),
                 "template": template_name,
+                "template_source": template_source,
                 "available_areas": available_areas,
             }
 
     def _validate_area_for_template(bereich_id: str) -> None:
         """Prüft bereich_id gegen die Bereiche der geladenen Vorlage."""
-        is_odw = bool(
-            bot.case.template == "op-de-wisch"
-            or (
-                bot.plan_data
-                and (
-                    getattr(bot.plan_data, "template", "") == "op-de-wisch"
-                    or any(
-                        getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                        for g in getattr(bot.plan_data, "goals", [])
-                    )
-                )
-            )
-        )
+        is_odw = ContextBuilder.is_odw_case(bot.case)
         valid_ids = {
             s.id for s in (OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS)
         }
@@ -532,26 +595,15 @@ def create_app(
 
     @app.get("/api/areas")
     async def get_areas(template: Optional[str] = None) -> Dict[str, Any]:
-        """Liefert die verfügbaren Lebensbereiche für die aktive oder angefragte Vorlage."""
+        """Liefert die verfügbaren Lebensbereiche für die aktive oder angefragte Vorlage (nur lesend)."""
         bot.check_ttl()
         if template:
-            norm = template.strip().lower()
-            is_odw = norm in {"op-de-wisch", "op_de_wisch", "hamburg_op_de_wisch", "odw"}
-            bot.case.template = "op-de-wisch" if is_odw else "hamburg"
+            template_key = _normalize_template(template)
+            is_odw = template_key == "op-de-wisch"
+            tpl_name = template_key
         else:
-            is_odw = bool(
-                bot.case.template == "op-de-wisch"
-                or (
-                    bot.plan_data
-                    and (
-                        getattr(bot.plan_data, "template", "") == "op-de-wisch"
-                        or any(
-                            getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                            for g in getattr(bot.plan_data, "goals", [])
-                        )
-                    )
-                )
-            )
+            is_odw = ContextBuilder.is_odw_case(bot.case)
+            tpl_name = "op-de-wisch" if is_odw else "hamburg"
         area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
         available_areas = [
             {
@@ -563,7 +615,7 @@ def create_app(
         ]
         return {
             "success": True,
-            "template": "op-de-wisch" if is_odw else "hamburg",
+            "template": tpl_name,
             "available_areas": available_areas,
             "areas": available_areas,
         }
@@ -572,10 +624,10 @@ def create_app(
     async def select_template(req: SelectTemplateRequest) -> Dict[str, Any]:
         """Wechselt die aktive Berichtsvorlage (hamburg oder op-de-wisch)."""
         bot.check_ttl()
-        norm = req.template.strip().lower()
-        is_odw = norm in {"op-de-wisch", "op_de_wisch", "hamburg_op_de_wisch", "odw"}
-        template_key = "op-de-wisch" if is_odw else "hamburg"
-        bot.case.template = template_key
+        template_key = _normalize_template(req.template)
+        is_odw = template_key == "op-de-wisch"
+        bot.case.set_template(template_key, selected=True)
+        logger.info("Berichtsvorlage gewählt: %s", template_key)
 
         area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
         valid_ids = {s.id for s in area_defs}
@@ -776,7 +828,7 @@ def create_app(
             ) from exc
 
     @app.post("/api/plan")
-    async def set_plan(req: SetPlanRequest) -> Dict[str, Any]:
+    async def set_plan(req: SetPlanRequest):
         """Hinterlegt einen Vorbericht / Gesamtplan als Kontext für den Chatbot."""
         if not req.plan_text.strip():
             raise HTTPException(status_code=400, detail="Plan-Text darf nicht leer sein.")
@@ -789,12 +841,20 @@ def create_app(
                 detail="❌ Kein gültiger Vorbericht erkannt: Es konnten keine Lebensbereiche oder Ziele extrahiert werden.",
             )
 
+        template_name = "op-de-wisch" if getattr(parsed_text_plan, "template", "") == "op-de-wisch" else "hamburg"
+        mismatch_resp = _check_template_mismatch(template_name)
+        if mismatch_resp is not None:
+            return mismatch_resp
+
+        was_selected = bool(getattr(bot.case, "template_selected", False))
+        template_source = "gewaehlt" if was_selected else "erkannt"
         info: Dict[str, Any] = {"goals_count": parsed_text_plan.goals_count}
         if req.filename:
             info["filename"] = req.filename
         if req.title:
             info["title"] = req.title
 
+        bot.case.set_template(template_name, selected=was_selected)
         bot.set_plan(parsed_text_plan)
         bot.set_plan_context(req.plan_text, plan_info=info)
         bot.plan_data = parsed_text_plan
@@ -808,6 +868,8 @@ def create_app(
             "is_fallback": getattr(parsed_text_plan, "is_fallback", True),
             "warning": getattr(parsed_text_plan, "warning", ""),
             "parser_source": getattr(parsed_text_plan, "parser_source", "text_plan"),
+            "template": template_name,
+            "template_source": template_source,
         }
 
     @app.post("/api/reset-plan")
@@ -1001,19 +1063,7 @@ def create_app(
                 "confirmed": bot.case.is_area_confirmed(bot.selected_bereich_id),
             }
 
-        is_odw = bool(
-            bot.case.template == "op-de-wisch"
-            or (
-                bot.plan_data
-                and (
-                    getattr(bot.plan_data, "template", "") == "op-de-wisch"
-                    or any(
-                        getattr(g, "section_id", "") in {"1", "2", "4", "5", "6", "7", "8", "9"}
-                        for g in getattr(bot.plan_data, "goals", [])
-                    )
-                )
-            )
-        )
+        is_odw = ContextBuilder.is_odw_case(bot.case)
         area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
         available_areas = [
             {
@@ -1056,6 +1106,7 @@ def create_app(
             "plan": plan_info,
             "model": bot.model_info,
             "template": template_name,
+            "template_selected": bool(getattr(bot.case, "template_selected", False)),
             "selected_area": selected_area_info,
             "available_areas": available_areas,
             "context_status": context_status_data,

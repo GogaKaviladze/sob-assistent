@@ -122,24 +122,30 @@ class ContextBuilder:
     """Baut deterministisch den isolierten Bereichs-Kontext aus Fall- und Verlaufsdaten."""
 
     @classmethod
+    def is_odw_case(cls, case: Any, bereich_id: Optional[str] = None) -> bool:
+        """Ermittelt, ob für den Fall die Op-de-Wisch-Vorlage aktiv ist."""
+        if getattr(case, "template", "") == "op-de-wisch":
+            return True
+        if getattr(case, "template_selected", False):
+            return False
+        plan = getattr(case, "plan", None)
+        if plan and (
+            getattr(plan, "template", "") == "op-de-wisch"
+            or any(
+                getattr(g, "section_id", "") in ODW_TITLES
+                and getattr(g, "section_id", "") not in HAMBURG_TITLES
+                for g in getattr(plan, "goals", [])
+            )
+        ):
+            return True
+        if bereich_id and bereich_id in ODW_TITLES and bereich_id not in HAMBURG_TITLES:
+            return True
+        return False
+
+    @classmethod
     def build(cls, case: Any, bereich_id: str) -> BuiltContext:
         """Erzeugt BuiltContext für den angegebenen Bereich."""
-        is_odw = bool(
-            getattr(case, "template", "") == "op-de-wisch"
-            or (
-                case.plan
-                and (
-                    getattr(case.plan, "template", "") == "op-de-wisch"
-                    or any(
-                        getattr(g, "section_id", "") in ODW_TITLES
-                        and getattr(g, "section_id", "") not in HAMBURG_TITLES
-                        for g in getattr(case.plan, "goals", [])
-                    )
-                )
-            )
-        )
-        if not is_odw and bereich_id in ODW_TITLES and bereich_id not in HAMBURG_TITLES:
-            is_odw = True
+        is_odw = cls.is_odw_case(case, bereich_id)
 
         bereich_title = get_canonical_title(bereich_id, is_odw)
 
@@ -343,16 +349,7 @@ class ContextBuilder:
     @classmethod
     def get_review_data(cls, case: Any, bereich_id: str) -> Dict[str, Any]:
         """Liefert strukturierte Daten für 'Bereich prüfen': Alt-SOB und zugeordnete CSV-Einträge."""
-        is_odw = bool(
-            case.plan
-            and any(
-                getattr(g, "section_id", "") in ODW_TITLES
-                and getattr(g, "section_id", "") not in HAMBURG_TITLES
-                for g in getattr(case.plan, "goals", [])
-            )
-        )
-        if not is_odw and bereich_id in ODW_TITLES and bereich_id not in HAMBURG_TITLES:
-            is_odw = True
+        is_odw = cls.is_odw_case(case, bereich_id)
 
         bereich_title = get_canonical_title(bereich_id, is_odw)
         confirmed = case.is_area_confirmed(bereich_id) if hasattr(case, "is_area_confirmed") else False

@@ -1047,6 +1047,23 @@
         </div>
       </div>
 
+      <div id="sidebarTemplateSection">
+        <div class="section-title">Berichtsvorlage / Träger</div>
+        <select
+          id="templateSelect"
+          class="model-select"
+          onchange="handleTemplateChange(this.value)"
+          style="width: 100%; max-width: 100%; padding: 8px 10px; font-size: 0.85rem;"
+          title="Berichtsvorlage vor oder unabhängig vom Upload wählen"
+        >
+          <option value="" selected>– Vorlage wählen –</option>
+          <option value="hamburg">Hamburg — Fachamt</option>
+          <option value="op-de-wisch">Op de Wisch</option>
+        </select>
+        <div id="templateDetectedNotice" role="status" style="display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: rgba(59, 130, 246, 0.12); border: 1px solid rgba(59, 130, 246, 0.4); color: #93c5fd; font-size: 0.8rem; line-height: 1.4;"></div>
+        <div id="templateMismatchError" role="alert" style="display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-size: 0.8rem; line-height: 1.4;"></div>
+      </div>
+
       <div>
         <div class="section-title">CSV-Falldaten</div>
         <div class="upload-zone" id="dropZone" onclick="document.getElementById('csvFileInput').click()">
@@ -1960,6 +1977,10 @@
           // Bei neuem Fall UI vorab leeren
           if (messagesContainer) messagesContainer.innerHTML = '';
           removePlanUI();
+          const sidebarSelect = document.getElementById('templateSelect');
+          if (sidebarSelect) sidebarSelect.value = '';
+          clearUploadBannerError('templateMismatchError');
+          clearTemplateDetectedNotice();
         }
         updateCsvUI(
           data.filename,
@@ -2119,6 +2140,13 @@
         const data = await res.json().catch(() => ({}));
         if (res.status >= 400 || !data.success) {
           const errMsg = setUploadBannerError('planUploadError', formatErrorDetail(data.detail || data.error, res.status));
+          if (data.detected_template || (errMsg && errMsg.includes('Vorlage prüfen'))) {
+            setUploadBannerError('templateMismatchError', errMsg);
+          }
+          clearTemplateDetectedNotice();
+          if (data.template) {
+            syncTemplateSelectors(data.template);
+          }
           appendErrorMessage(errMsg);
           allSessionMessages.push({ role: 'error', content: errMsg, bereich_id: currentSelectedAreaId });
           showModalError("Fehler beim Vorbericht-Laden", errMsg);
@@ -2126,6 +2154,7 @@
           return;
         }
         clearUploadBannerError('planUploadError');
+        clearUploadBannerError('templateMismatchError');
         if (newCase) {
           if (messagesContainer) messagesContainer.innerHTML = '';
           removeCsvUI();
@@ -2144,10 +2173,13 @@
           data.is_fallback
         );
         if (data.template) {
-          const templateSelect = document.getElementById('exportTemplateSelect');
-          if (templateSelect) {
-            templateSelect.value = data.template;
-          }
+          syncTemplateSelectors(data.template);
+        }
+        if (data.template_source === 'erkannt') {
+          const tplLabel = data.template === 'op-de-wisch' ? 'Op de Wisch' : 'Hamburg';
+          setTemplateDetectedNotice(`Vorlage aus Vorbericht übernommen: ${tplLabel} – bitte prüfen`);
+        } else {
+          clearTemplateDetectedNotice();
         }
         if (data.available_areas) {
           currentSelectedAreaId = null;
@@ -2577,6 +2609,10 @@
         if (areaSelect) areaSelect.value = '';
         if (areaCounters) areaCounters.style.display = 'none';
         if (confirmAreaBtn) confirmAreaBtn.style.display = 'none';
+        const sidebarSelect = document.getElementById('templateSelect');
+        if (sidebarSelect) sidebarSelect.value = '';
+        clearUploadBannerError('templateMismatchError');
+        clearTemplateDetectedNotice();
         updateChatLockState();
 
         // CSV UI zurücksetzen
@@ -2804,24 +2840,61 @@
       }
     }
 
+    function setTemplateDetectedNotice(text) {
+      const el = document.getElementById('templateDetectedNotice');
+      if (el) {
+        el.textContent = text;
+        el.style.display = text ? 'block' : 'none';
+      }
+    }
+
+    function clearTemplateDetectedNotice() {
+      const el = document.getElementById('templateDetectedNotice');
+      if (el) {
+        el.textContent = '';
+        el.style.display = 'none';
+      }
+    }
+
+    function syncTemplateSelectors(templateVal) {
+      if (!templateVal) return;
+      const sidebarSelect = document.getElementById('templateSelect');
+      const exportSelect = document.getElementById('exportTemplateSelect');
+      if (sidebarSelect) sidebarSelect.value = templateVal;
+      if (exportSelect) exportSelect.value = templateVal;
+    }
+
     async function handleTemplateChange(templateVal) {
       if (!templateVal) return;
+      syncTemplateSelectors(templateVal);
+      clearUploadBannerError('templateMismatchError');
+      clearTemplateDetectedNotice();
       try {
-        const res = await fetch(`/api/areas?template=${encodeURIComponent(templateVal)}`);
+        const res = await fetch('/api/template', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ template: templateVal })
+        });
         if (res.ok) {
           const data = await res.json();
+          syncTemplateSelectors(data.template || templateVal);
           const areas = data.available_areas || data.areas;
           currentSelectedAreaId = null;
           populateAreaSelect(areas, null);
           if (areaCounters) areaCounters.style.display = 'none';
           updateConfirmButtonState(false);
           updateChatLockState();
-          showToast(`Vorlage gewechselt: ${templateVal === 'op-de-wisch' ? 'Op de Wisch' : 'Hamburg'}`);
+          showToast(`Vorlage gewählt: ${(data.template || templateVal) === 'op-de-wisch' ? 'Op de Wisch' : 'Hamburg'}`);
         } else {
-          showModalError("Fehler beim Vorlagenwechsel", `HTTP ${res.status}`);
+          const errData = await res.json().catch(() => ({}));
+          const errMsg = formatErrorDetail(errData.detail || `HTTP ${res.status}`, res.status);
+          setUploadBannerError('templateMismatchError', errMsg);
+          showModalError("Fehler beim Vorlagenwechsel", errMsg);
         }
       } catch (err) {
-        showModalError("Fehler beim Vorlagenwechsel", err.message);
+        const errMsg = formatErrorDetail(err.message);
+        setUploadBannerError('templateMismatchError', errMsg);
+        showModalError("Fehler beim Vorlagenwechsel", errMsg);
       }
     }
 
@@ -3003,10 +3076,15 @@
             data.plan.is_fallback
           );
         }
-        if (data.template) {
-          const templateSelect = document.getElementById('exportTemplateSelect');
-          if (templateSelect) {
-            templateSelect.value = data.template;
+        if (data.template_selected && data.template) {
+          syncTemplateSelectors(data.template);
+          clearTemplateDetectedNotice();
+        } else {
+          const sidebarSelect = document.getElementById('templateSelect');
+          if (sidebarSelect) sidebarSelect.value = '';
+          if (data.template) {
+            const exportSelect = document.getElementById('exportTemplateSelect');
+            if (exportSelect) exportSelect.value = data.template;
           }
         }
         if (data.available_areas) {

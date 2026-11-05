@@ -20,6 +20,7 @@ class CaseSession:
 
     fall_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     template: str = "hamburg"
+    template_selected: bool = False
     csv: Optional[CsvData] = None
     plan: Optional[PlanData] = None
     plan_context: Optional[str] = None
@@ -28,6 +29,12 @@ class CaseSession:
     area_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     selected_bereich_id: Optional[str] = None
     last_activity: float = field(default_factory=time.time)
+
+    def set_template(self, template: str, *, selected: bool = True) -> None:
+        """Setzt die Berichtsvorlage im Session-State (selected=True für explizite Fachkraft-Wahl)."""
+        self.template = template
+        self.template_selected = selected
+        self.touch()
 
     def touch(self, now: Optional[float] = None) -> None:
         """Aktualisiert den Zeitstempel der letzten Fall-Aktivität."""
@@ -59,7 +66,8 @@ class CaseSession:
 
     def clear(self) -> None:
         """Setzt sämtliche Falldaten zurück."""
-        self.template = "hamburg"
+        object.__setattr__(self, "template", "hamburg")
+        object.__setattr__(self, "template_selected", False)
         self.csv = None
         self.plan = None
         self.plan_context = None

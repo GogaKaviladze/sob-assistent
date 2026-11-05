@@ -820,3 +820,98 @@ def test_case_template_direct_assignment_does_not_set_selected():
     session.set_template("op-de-wisch", selected=True)
     assert session.template_selected is True
 
+
+def test_ui_clear_all_upload_banners_on_reset_and_upload():
+    """Issue #31: index.html leert bei 'Neuer Fall' (resetAll) und erfolgreichen Uploads alle Fehlerbanner.
+    Prüft clearAllUploadBanners(), dessen Aufruf in resetAll(), handleFileSelected, handlePlanFileSelected,
+    und das Zurücksetzen des Vorlagen-Dropdowns auf '– Vorlage wählen –'.
+    """
+    from pathlib import Path
+    html_path = Path(__file__).resolve().parents[1] / "chat_app" / "templates" / "index.html"
+    html = html_path.read_text(encoding="utf-8")
+
+    # 1. Zentrale Funktion clearAllUploadBanners() existiert
+    caub_match = re.search(
+        r"function\s+clearAllUploadBanners\s*\(\s*\)\s*\{(.*?)\n\s*\}",
+        html,
+        flags=re.DOTALL,
+    )
+    assert caub_match is not None, "clearAllUploadBanners() muss in index.html definiert sein"
+    caub_body = caub_match.group(1)
+
+    # Prüft, dass alle drei Fehlerbanner und der Hinweis geleert werden
+    assert "clearUploadBannerError('csvUploadError')" in caub_body or 'clearUploadBannerError("csvUploadError")' in caub_body
+    assert "clearUploadBannerError('planUploadError')" in caub_body or 'clearUploadBannerError("planUploadError")' in caub_body
+    assert "clearUploadBannerError('templateMismatchError')" in caub_body or 'clearUploadBannerError("templateMismatchError")' in caub_body
+    assert "clearTemplateDetectedNotice()" in caub_body
+
+    # 2. resetAll() ruft clearAllUploadBanners() auf und setzt #templateSelect auf ''
+    reset_match = re.search(
+        r"async\s+function\s+resetAll\s*\(\s*\)\s*\{(.*?)\n\s*\}",
+        html,
+        flags=re.DOTALL,
+    )
+    assert reset_match is not None, "resetAll() muss in index.html definiert sein"
+    reset_body = reset_match.group(1)
+
+    assert "clearAllUploadBanners()" in reset_body, "resetAll() muss clearAllUploadBanners() aufrufen"
+    assert "templateSelect" in reset_body
+    assert ".value = ''" in reset_body or '.value = ""' in reset_body
+
+    # 3. handleFileSelected (CSV) ruft bei erfolgreichem Upload clearAllUploadBanners() auf
+    hfs_match = re.search(
+        r"async\s+function\s+handleFileSelected\s*\([^)]*\)\s*\{(.*?)\n\s*function\s+updateCsvUI",
+        html,
+        flags=re.DOTALL,
+    )
+    assert hfs_match is not None
+    hfs_body = hfs_match.group(1)
+    assert "clearAllUploadBanners()" in hfs_body, "handleFileSelected muss clearAllUploadBanners() nutzen"
+
+    # 4. handlePlanFileSelected (Plan) ruft bei erfolgreichem Upload clearAllUploadBanners() auf
+    hpfs_match = re.search(
+        r"async\s+function\s+handlePlanFileSelected\s*\([^)]*\)\s*\{(.*?)\n\s*function\s+updatePlanUI",
+        html,
+        flags=re.DOTALL,
+    )
+    assert hpfs_match is not None
+    hpfs_body = hpfs_match.group(1)
+    assert "clearAllUploadBanners()" in hpfs_body, "handlePlanFileSelected muss clearAllUploadBanners() nutzen"
+
+
+def test_api_reset_clears_template_selected_and_error_states():
+    """Issue #31 Backend-Test: POST /api/reset setzt template_selected auf False und hinterlässt keine Fehlerzustände."""
+    bot = ReflectionChatbot(provider=RecordingMockLLM())
+    client = TestClient(create_app(chatbot=bot))
+
+    # Vorlage explizit wählen
+    res_tpl = client.post("/api/template", json={"template": "op-de-wisch"})
+    assert res_tpl.status_code == 200
+    sess_before = client.get("/api/session").json()
+    assert sess_before["template_selected"] is True
+    assert sess_before["template"] == "op-de-wisch"
+
+    # Mismatch provozieren durch Upload eines Hamburg-Vorberichts
+    hamburg_bytes = build_hamburg_vorbericht()
+    res_upload = client.post(
+        "/api/upload-plan",
+        files={"file": ("vorbericht.docx", io.BytesIO(hamburg_bytes), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res_upload.status_code == 422
+    assert "Vorlage prüfen" in res_upload.json()["detail"]
+
+    # Neuer Fall: POST /api/reset
+    res_reset = client.post("/api/reset")
+    assert res_reset.status_code == 200
+    assert res_reset.json() == {"success": True}
+
+    # /api/session prüfen
+    sess_after = client.get("/api/session").json()
+    assert sess_after["template_selected"] is False
+    assert sess_after["has_csv"] is False
+    assert sess_after["has_plan"] is False
+    assert sess_after["model_error"] is None
+    assert sess_after["case_closed_reason"] is None
+    assert len(sess_after["messages"]) == 0
+
+

@@ -234,21 +234,31 @@ class ContextBuilder:
         else:
             target_hamburg_ids = {bereich_id}
 
+        manual_assignments: Dict[str, str] = getattr(case, "manual_assignments", {}) or {}
+
         if case.csv and getattr(case.csv, "entries", None):
             entries = case.csv.entries
             total_count = len(entries)
 
-            # Chronologisch sortieren (aufsteigend)
+            # Chronologisch sortieren (aufsteigend) mit stabilem CSV-Index
+            indexed_entries = list(enumerate(entries))
             sorted_entries = sorted(
-                entries,
-                key=lambda e: _parse_entry_datetime(e.datum, getattr(e, "uhrzeit", "")),
+                indexed_entries,
+                key=lambda item: _parse_entry_datetime(item[1].datum, getattr(item[1], "uhrzeit", "")),
             )
 
-            for e in sorted_entries:
+            for orig_idx, e in sorted_entries:
                 search_text = f"{e.kategorie} {e.text}"
                 matched_sec_ids = classify_entry_sections(search_text)
-                is_unassigned = len(matched_sec_ids) == 0
-                is_assigned = bool(matched_sec_ids & target_hamburg_ids)
+                is_auto = len(matched_sec_ids) > 0
+                manual_target = manual_assignments.get(str(orig_idx))
+
+                if manual_target is not None:
+                    is_unassigned = False
+                    is_assigned = (manual_target == bereich_id)
+                else:
+                    is_unassigned = not is_auto
+                    is_assigned = bool(matched_sec_ids & target_hamburg_ids)
 
                 if is_assigned:
                     assigned_count += 1
@@ -284,11 +294,19 @@ class ContextBuilder:
             headers = getattr(case.csv, "headers", [])
             total_count = len(rows)
 
-            for idx, r in enumerate(rows, start=1):
+            for orig_idx, r in enumerate(rows):
+                idx = orig_idx + 1
                 search_text = " ".join(r)
                 matched_sec_ids = classify_entry_sections(search_text)
-                is_unassigned = len(matched_sec_ids) == 0
-                is_assigned = bool(matched_sec_ids & target_hamburg_ids)
+                is_auto = len(matched_sec_ids) > 0
+                manual_target = manual_assignments.get(str(orig_idx))
+
+                if manual_target is not None:
+                    is_unassigned = False
+                    is_assigned = (manual_target == bereich_id)
+                else:
+                    is_unassigned = not is_auto
+                    is_assigned = bool(matched_sec_ids & target_hamburg_ids)
 
                 date_val = r[0] if r else ""
                 if is_assigned:
@@ -429,25 +447,39 @@ class ContextBuilder:
         else:
             target_hamburg_ids = {bereich_id}
 
+        manual_assignments: Dict[str, str] = getattr(case, "manual_assignments", {}) or {}
+
         if case.csv and getattr(case.csv, "entries", None):
             entries = case.csv.entries
             total_count = len(entries)
+            indexed_entries = list(enumerate(entries))
             sorted_entries = sorted(
-                entries,
-                key=lambda e: _parse_entry_datetime(e.datum, getattr(e, "uhrzeit", "")),
+                indexed_entries,
+                key=lambda item: _parse_entry_datetime(item[1].datum, getattr(item[1], "uhrzeit", "")),
             )
-            for e in sorted_entries:
+            for orig_idx, e in sorted_entries:
                 search_text = f"{e.kategorie} {e.text}"
                 matched_sec_ids = classify_entry_sections(search_text)
-                is_unassigned = len(matched_sec_ids) == 0
-                is_assigned = bool(matched_sec_ids & target_hamburg_ids)
+                is_auto = len(matched_sec_ids) > 0
+                manual_target = manual_assignments.get(str(orig_idx))
+
+                if manual_target is not None:
+                    is_unassigned = False
+                    is_assigned = (manual_target == bereich_id)
+                else:
+                    is_unassigned = not is_auto
+                    is_assigned = bool(matched_sec_ids & target_hamburg_ids)
 
                 entry_dict = {
+                    "id": str(orig_idx),
+                    "entry_id": str(orig_idx),
                     "datum": getattr(e, "datum", ""),
                     "uhrzeit": getattr(e, "uhrzeit", ""),
                     "kategorie": getattr(e, "kategorie", ""),
                     "text": getattr(e, "text", ""),
                     "formatted": _format_vivendi_entry(e),
+                    "manual_bereich_id": manual_target,
+                    "is_manual": manual_target is not None,
                 }
                 if is_assigned:
                     assigned_entries.append(entry_dict)
@@ -458,23 +490,39 @@ class ContextBuilder:
             rows = case.csv.rows
             headers = getattr(case.csv, "headers", [])
             total_count = len(rows)
-            for idx, r in enumerate(rows, start=1):
+            for orig_idx, r in enumerate(rows):
+                idx = orig_idx + 1
                 search_text = " ".join(r)
                 matched_sec_ids = classify_entry_sections(search_text)
-                is_unassigned = len(matched_sec_ids) == 0
-                is_assigned = bool(matched_sec_ids & target_hamburg_ids)
+                is_auto = len(matched_sec_ids) > 0
+                manual_target = manual_assignments.get(str(orig_idx))
+
+                if manual_target is not None:
+                    is_unassigned = False
+                    is_assigned = (manual_target == bereich_id)
+                else:
+                    is_unassigned = not is_auto
+                    is_assigned = bool(matched_sec_ids & target_hamburg_ids)
 
                 entry_dict = {
+                    "id": str(orig_idx),
+                    "entry_id": str(orig_idx),
                     "datum": r[0] if len(r) > 0 else "",
                     "uhrzeit": "",
                     "kategorie": r[1] if len(r) > 1 else "",
                     "text": " | ".join(r),
                     "formatted": _format_generic_row(idx, r, headers),
+                    "manual_bereich_id": manual_target,
+                    "is_manual": manual_target is not None,
                 }
                 if is_assigned:
                     assigned_entries.append(entry_dict)
                 elif is_unassigned:
                     unassigned_entries.append(entry_dict)
+
+        # Bereichsoptionen für die manuelle Zuordnung: genau aus derselben Vorlagenquelle
+        area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+        area_options = [{"id": s.id, "title": s.title} for s in area_defs]
 
         return {
             "bereich_id": bereich_id,
@@ -486,4 +534,6 @@ class ContextBuilder:
             "assigned_count": len(assigned_entries),
             "unassigned_count": len(unassigned_entries),
             "total_count": total_count,
+            "area_options": area_options,
+            "available_areas": area_options,
         }

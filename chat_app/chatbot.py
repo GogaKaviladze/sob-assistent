@@ -824,6 +824,7 @@ class ReflectionChatbot:
         """Setzt oder aktualisiert die geladene CSV-Datei als Kontext."""
         with self._lock:
             self.case.csv = csv_data
+            self.case.manual_assignments.clear()
             self.touch()
 
     def set_plan(self, plan: Any) -> None:

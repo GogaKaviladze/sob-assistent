@@ -1296,6 +1296,9 @@
         <button class="btn btn-outline" onclick="closeAreaReviewModal()">✕ Schließen</button>
       </div>
       <div class="modal-body" style="gap: 16px;">
+        <!-- Fehleranzeige bei Zuordnungsfehlern (rot, 422) -->
+        <div id="reviewAssignError" style="display: none; color: #ef4444; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 6px; padding: 8px 12px; font-size: 0.8rem; font-weight: 500;"></div>
+
         <!-- Alt-SOB / Vorbericht Karte -->
         <div style="background: #0f172a; border: 1px solid var(--card-border); border-radius: 8px; padding: 14px;">
           <div style="font-weight: 600; color: #38bdf8; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
@@ -1559,7 +1562,12 @@
       const unassignedSummaryEl = document.getElementById('reviewUnassignedSummary');
       const unassignedListEl = document.getElementById('reviewUnassignedEntries');
       const confirmBtn = document.getElementById('reviewConfirmBtn');
+      const assignErrEl = document.getElementById('reviewAssignError');
 
+      if (assignErrEl) {
+        assignErrEl.textContent = '';
+        assignErrEl.style.display = 'none';
+      }
       if (titleEl) titleEl.textContent = `${currentSelectedAreaId} ...`;
       if (altSobEl) altSobEl.textContent = 'Lade Daten…';
       if (assignedListEl) assignedListEl.innerHTML = '<div style="color: #94a3b8; font-size: 0.8rem;">Lade Einträge…</div>';
@@ -1577,6 +1585,7 @@
           return;
         }
         const data = await res.json();
+        const areaOptions = data.area_options || data.available_areas || [];
         if (titleEl) titleEl.textContent = `${data.bereich_id} (${data.bereich_title})`;
 
         if (badgeEl) {
@@ -1629,35 +1638,70 @@
         if (assignedCountEl) assignedCountEl.textContent = data.assigned_count;
         if (assignedListEl) {
           if (data.assigned_entries && data.assigned_entries.length > 0) {
-            assignedListEl.innerHTML = data.assigned_entries.map(e => `
-              <div style="background: #1e293b; border-radius: 6px; padding: 8px 10px; font-size: 0.8rem; line-height: 1.4;">
-                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 4px; font-size: 0.75rem; color: #94a3b8;">
-                  <span style="font-weight: 600; color: #4ade80;">📅 ${escapeHtml(e.datum || '-')}${e.uhrzeit ? ' ' + escapeHtml(e.uhrzeit) : ''}</span>
-                  ${e.kategorie ? `<span style="background: rgba(74, 222, 128, 0.15); color: #4ade80; padding: 1px 6px; border-radius: 4px;">${escapeHtml(e.kategorie)}</span>` : ''}
+            assignedListEl.innerHTML = data.assigned_entries.map(e => {
+              const entryId = String(e.entry_id !== undefined ? e.entry_id : (e.id !== undefined ? e.id : ''));
+              let manualBadgeAndReassign = '';
+              if (e.is_manual) {
+                const reassignOptions = areaOptions.map(opt => {
+                  const isSel = opt.id === data.bereich_id ? 'selected' : '';
+                  return `<option value="${escapeHtml(opt.id)}" ${isSel}>${escapeHtml(opt.id)} ${escapeHtml(opt.title)}</option>`;
+                }).join('');
+                manualBadgeAndReassign = `
+                  <div style="display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap;">
+                    <span style="background: rgba(59, 130, 246, 0.15); color: #60a5fa; padding: 2px 7px; border-radius: 4px; font-size: 0.72rem; font-weight: 500;">Manuell zugeordnet</span>
+                    <label for="reassign_entry_${escapeHtml(entryId)}" style="font-size: 0.72rem; color: #94a3b8; white-space: nowrap;">Bereich umhängen:</label>
+                    <select id="reassign_entry_${escapeHtml(entryId)}" class="entry-assign-select" style="background: #0f172a; border: 1px solid var(--card-border); color: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem;" onchange="assignEntryToArea('${escapeHtml(entryId)}', this.value)">
+                      ${reassignOptions}
+                    </select>
+                  </div>
+                `;
+              }
+              return `
+                <div style="background: #1e293b; border-radius: 6px; padding: 8px 10px; font-size: 0.8rem; line-height: 1.4;">
+                  <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 4px; font-size: 0.75rem; color: #94a3b8;">
+                    <span style="font-weight: 600; color: #94a3b8; font-family: monospace;">#${escapeHtml(entryId)}</span>
+                    <span style="font-weight: 600; color: #4ade80;">📅 ${escapeHtml(e.datum || '-')}${e.uhrzeit ? ' ' + escapeHtml(e.uhrzeit) : ''}</span>
+                    ${e.kategorie ? `<span style="background: rgba(74, 222, 128, 0.15); color: #4ade80; padding: 1px 6px; border-radius: 4px;">${escapeHtml(e.kategorie)}</span>` : ''}
+                  </div>
+                  <div style="color: #cbd5e1;">${escapeHtml(e.text || e.formatted || '')}</div>
+                  ${manualBadgeAndReassign}
                 </div>
-                <div style="color: #cbd5e1;">${escapeHtml(e.text || e.formatted || '')}</div>
-              </div>
-            `).join('');
+              `;
+            }).join('');
           } else {
             assignedListEl.innerHTML = '<div style="color: #64748b; font-size: 0.8rem; font-style: italic;">Keine Dokumentationseinträge schlüsselwortbasiert diesem Bereich zugeordnet.</div>';
           }
         }
 
-        // 3. Nicht zugeordnete Einträge
+        // 3. Nicht zugeordnete Einträge rendern mit stabiler ID und Dropdown
         if (unassignedSummaryEl) {
           unassignedSummaryEl.textContent = `+ ${data.unassigned_count} nicht zugeordnete Einträge (Allgemeinkontext)`;
         }
         if (unassignedListEl) {
           if (data.unassigned_entries && data.unassigned_entries.length > 0) {
-            unassignedListEl.innerHTML = data.unassigned_entries.map(e => `
-              <div style="background: #1e293b; border-radius: 6px; padding: 6px 8px; font-size: 0.78rem; line-height: 1.35;">
-                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 2px; font-size: 0.72rem; color: #64748b;">
-                  <span>📅 ${escapeHtml(e.datum || '-')}${e.uhrzeit ? ' ' + escapeHtml(e.uhrzeit) : ''}</span>
-                  ${e.kategorie ? `<span>[${escapeHtml(e.kategorie)}]</span>` : ''}
+            unassignedListEl.innerHTML = data.unassigned_entries.map(e => {
+              const entryId = String(e.entry_id !== undefined ? e.entry_id : (e.id !== undefined ? e.id : ''));
+              const selectOptions = areaOptions.map(opt =>
+                `<option value="${escapeHtml(opt.id)}">${escapeHtml(opt.id)} ${escapeHtml(opt.title)}</option>`
+              ).join('');
+              return `
+                <div style="background: #1e293b; border-radius: 6px; padding: 8px 10px; font-size: 0.78rem; line-height: 1.35; display: flex; flex-direction: column; gap: 6px;">
+                  <div style="display: flex; gap: 8px; align-items: center; font-size: 0.72rem; color: #64748b;">
+                    <span style="font-weight: 600; color: #94a3b8; font-family: monospace;">#${escapeHtml(entryId)}</span>
+                    <span>📅 ${escapeHtml(e.datum || '-')}${e.uhrzeit ? ' ' + escapeHtml(e.uhrzeit) : ''}</span>
+                    ${e.kategorie ? `<span style="background: rgba(148, 163, 184, 0.15); color: #cbd5e1; padding: 1px 5px; border-radius: 3px;">${escapeHtml(e.kategorie)}</span>` : ''}
+                  </div>
+                  <div style="color: #cbd5e1;">${escapeHtml(e.text || e.formatted || '')}</div>
+                  <div style="display: flex; align-items: center; gap: 8px; margin-top: 2px; flex-wrap: wrap;">
+                    <label for="assign_entry_${escapeHtml(entryId)}" style="font-size: 0.72rem; color: #94a3b8; white-space: nowrap;">Bereich zuordnen:</label>
+                    <select id="assign_entry_${escapeHtml(entryId)}" class="entry-assign-select" style="background: #0f172a; border: 1px solid var(--card-border); color: #f1f5f9; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem;" onchange="assignEntryToArea('${escapeHtml(entryId)}', this.value)">
+                      <option value="">-- Bereich wählen --</option>
+                      ${selectOptions}
+                    </select>
+                  </div>
                 </div>
-                <div style="color: #94a3b8;">${escapeHtml(e.text || e.formatted || '')}</div>
-              </div>
-            `).join('');
+              `;
+            }).join('');
           } else {
             unassignedListEl.innerHTML = '<div style="color: #64748b; font-size: 0.78rem; font-style: italic;">Keine unzugeordneten Einträge vorhanden.</div>';
           }
@@ -1672,9 +1716,61 @@
       }
     }
 
+    async function assignEntryToArea(entryId, bereichId) {
+      if (!bereichId) return;
+      const errorEl = document.getElementById('reviewAssignError');
+      if (errorEl) {
+        errorEl.textContent = '';
+        errorEl.style.display = 'none';
+      }
+
+      try {
+        const res = await fetch('/api/entry/assign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entry_id: String(entryId), bereich_id: String(bereichId) })
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          let errMsg = errData.detail;
+          if (typeof errMsg !== 'string') {
+            errMsg = Array.isArray(errMsg) ? errMsg.map(m => m.msg || JSON.stringify(m)).join(', ') : 'Zuordnung fehlgeschlagen.';
+          }
+          if (!errMsg.startsWith('❌')) {
+            errMsg = '❌ ' + errMsg;
+          }
+          if (errorEl) {
+            errorEl.textContent = errMsg;
+            errorEl.style.display = 'block';
+          }
+          await openAreaReviewModal();
+          return;
+        }
+
+        // Bei Erfolg Modal mit aktualisierten Zuordnungen und Zählern neu laden
+        await openAreaReviewModal();
+
+        // Haupt-UI Zähler aktualisieren (falls Bereich aktiv)
+        if (typeof loadSession === 'function') {
+          await loadSession();
+        }
+      } catch (err) {
+        if (errorEl) {
+          errorEl.textContent = '❌ Kommunikationsfehler: ' + err.message;
+          errorEl.style.display = 'block';
+        }
+      }
+    }
+
     function closeAreaReviewModal() {
       const modal = document.getElementById('areaReviewModal');
       if (modal) modal.classList.remove('active');
+      const errorEl = document.getElementById('reviewAssignError');
+      if (errorEl) {
+        errorEl.textContent = '';
+        errorEl.style.display = 'none';
+      }
     }
 
     function toggleReviewUnassigned() {

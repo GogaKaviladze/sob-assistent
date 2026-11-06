@@ -23,7 +23,7 @@ from sob_generator.docx_safety import UnsafeDocxError
 from sob_generator.llm.sections import SECTION_DEFINITIONS
 from sob_generator.llm.sections_op_de_wisch import OP_DE_WISCH_SECTION_DEFINITIONS
 from .chatbot import ReflectionChatbot, ReflectionEngine, get_candidate_model_directories
-from .context_builder import ContextBuilder
+from .context_builder import ContextBuilder, classify_entry_sections
 from .csv_loader import CsvData, parse_csv_content
 from .docx_exporter import (
     DocxExportError,
@@ -76,6 +76,11 @@ class SelectAreaRequest(BaseModel):
 
 class SelectTemplateRequest(BaseModel):
     template: str
+
+
+class AssignEntryRequest(BaseModel):
+    entry_id: str
+    bereich_id: str
 
 
 DEFAULT_DOCX_PARSE_TIMEOUT = 10.0
@@ -735,6 +740,92 @@ def create_app(
             "success": True,
             "bereich_id": req.bereich_id,
             "confirmed": True,
+        }
+
+    @app.post("/api/entry/assign")
+    async def assign_entry(req: AssignEntryRequest) -> Dict[str, Any]:
+        """Ordnet einen Verlaufseintrag manuell einem Lebensbereich zu (Issue #32, RAM-only)."""
+        bot.check_ttl()
+
+        # 1. Vorlagenwahl prüfen: Muss explizit durch Fachkraft gewählt sein
+        if not getattr(bot.case, "template_selected", False):
+            raise HTTPException(
+                status_code=422,
+                detail="❌ Bitte zuerst eine Vorlage wählen.",
+            )
+
+        # 2. CSV prüfen: Muss geladen sein
+        if not bot.has_csv or bot.case.csv is None:
+            raise HTTPException(
+                status_code=422,
+                detail="❌ Keine CSV-Datei geladen.",
+            )
+
+        # 3. Vorlagenabgleich: Gehört der Bereich zur aktiven Session-Vorlage?
+        is_odw = ContextBuilder.is_odw_case(bot.case)
+        area_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
+        valid_area_ids = {s.id for s in area_defs}
+        if req.bereich_id not in valid_area_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=f"❌ Bereich „{req.bereich_id}“ gehört nicht zur gewählten Vorlage.",
+            )
+
+        # 4. Eintrags-ID prüfen: Muss ein gültiger Index in der CSV sein
+        csv = bot.case.csv
+        entries_list = getattr(csv, "entries", None)
+        rows_list = getattr(csv, "rows", None)
+        total_entries = len(entries_list) if entries_list else (len(rows_list) if rows_list else 0)
+
+        try:
+            idx = int(req.entry_id)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"❌ Unbekannte Eintrags-ID „{req.entry_id}“.",
+            )
+
+        if idx < 0 or idx >= total_entries:
+            raise HTTPException(
+                status_code=422,
+                detail=f"❌ Unbekannte Eintrags-ID „{req.entry_id}“.",
+            )
+
+        # 5. Automatische Zuordnung prüfen:
+        # Nur unzugeordnete Einträge (oder bereits manuell zugeordnete) dürfen zugeordnet werden.
+        if entries_list:
+            entry_obj = entries_list[idx]
+            search_text = f"{entry_obj.kategorie} {entry_obj.text}"
+        else:
+            row_obj = rows_list[idx]
+            search_text = " ".join(row_obj)
+
+        matched_sec_ids = classify_entry_sections(search_text)
+        is_auto = len(matched_sec_ids) > 0
+        if is_auto:
+            raise HTTPException(
+                status_code=422,
+                detail="❌ Automatisch zugeordnete Einträge können nicht manuell zugeordnet werden.",
+            )
+
+        # 6. Manuelle Zuordnung im RAM speichern
+        bot.case.assign_entry(str(idx), req.bereich_id)
+
+        # 7. Logging: DSGVO-konform nur IDs und Zähler (keine Texte oder Namen)
+        logger.info(
+            "Eintrag manuell zugeordnet: entry_id=%s, bereich_id=%s",
+            idx,
+            req.bereich_id,
+        )
+
+        built = ContextBuilder.build(bot.case, req.bereich_id)
+        return {
+            "success": True,
+            "entry_id": str(idx),
+            "bereich_id": req.bereich_id,
+            "assigned_count": built.assigned_count,
+            "unassigned_count": built.unassigned_count,
+            "total_count": built.total_count,
         }
 
     @app.post("/api/chat-stream")

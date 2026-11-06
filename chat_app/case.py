@@ -27,6 +27,7 @@ class CaseSession:
     plan_info: Dict[str, Any] = field(default_factory=dict)
     messages: List[Dict[str, Any]] = field(default_factory=list)
     area_state: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    manual_assignments: Dict[str, str] = field(default_factory=dict)
     selected_bereich_id: Optional[str] = None
     last_activity: float = field(default_factory=time.time)
 
@@ -64,6 +65,15 @@ class CaseSession:
         self.get_area_state(bereich_id)["confirmed"] = True
         self.touch()
 
+    def assign_entry(self, entry_id: str, bereich_id: str) -> None:
+        """Weist einen unzugeordneten oder manuell zugeordneten Verlaufseintrag einem Lebensbereich zu (Issue #32, RAM-only)."""
+        self.manual_assignments[str(entry_id)] = bereich_id
+        self.touch()
+
+    def get_assigned_area(self, entry_id: str) -> Optional[str]:
+        """Liefert den manuell zugewiesenen Lebensbereich eines Eintrags oder None."""
+        return self.manual_assignments.get(str(entry_id))
+
     def clear(self) -> None:
         """Setzt sämtliche Falldaten zurück."""
         object.__setattr__(self, "template", "hamburg")
@@ -74,5 +84,6 @@ class CaseSession:
         self.plan_info.clear()
         self.messages.clear()
         self.area_state.clear()
+        self.manual_assignments.clear()
         self.selected_bereich_id = None
         self.touch()

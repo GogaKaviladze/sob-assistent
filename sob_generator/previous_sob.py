@@ -527,6 +527,10 @@ class UniversalPlanImporter:
                 m_sz = re.search(smart_pattern + r"\s*(.*)", row_text, re.IGNORECASE | re.DOTALL)
                 if m_sz:
                     sz = _clean(_strip_form_boilerplate(m_sz.group(1)))
+            elif re.search(smart_pattern, row_text, re.IGNORECASE):
+                m_sz = re.search(smart_pattern + r"\s*(.*)", row_text, re.IGNORECASE | re.DOTALL)
+                if m_sz:
+                    sz = _clean(_strip_form_boilerplate(m_sz.group(1)))
             elif "Bericht zur Zielerreichung" in row_text:
                 parts = re.split(r"Bericht\s+zur\s+Zielerreichung[^\n:]*:\s*", row_text, flags=re.IGNORECASE)
                 if len(parts) > 1:
@@ -738,7 +742,7 @@ class UniversalPlanImporter:
 
         # Klientenname
         m_client = re.search(
-            r"Bericht\s+für\s*(?:\(Name,\s*Vorname\))?\s*:[ \t\u00a0]*([^\n\t\r]+)",
+            r"(?:Bericht\s+für\s*(?:\(Name,\s*Vorname\))?|Klient(?:in)?|Betreute\s+Person)\s*:[ \t\u00a0]*([^\n\t\r]+)",
             combined_text,
             re.IGNORECASE,
         )
@@ -779,24 +783,39 @@ class UniversalPlanImporter:
             or "fo_svb" in fallback_source.name.lower()
         )
         if not is_odw:
+            sub_id_pattern = re.compile(r"^(?:(?:lebensbereich|bereich|abschnitt)\s+)?\d\.\d\b", re.IGNORECASE)
+            odw_id_pattern = re.compile(r"^(?:(?:lebensbereich|bereich|abschnitt)\s+)?[124-9]\b", re.IGNORECASE)
             has_sub_id = False
-            has_odw_high_id = False
+            has_odw_id = False
             for t in doc.tables:
                 for r_idx in range(min(2, len(t.rows))):
                     if len(t.rows[r_idx].cells) > 0:
                         cell_txt = _extract_cell_text_with_sdt(t.cell(r_idx, 0)).strip()
-                        if re.match(r"^\d\.\d\b", cell_txt):
+                        if sub_id_pattern.match(cell_txt):
                             has_sub_id = True
-                        elif re.match(r"^[4-9]\b", cell_txt):
-                            has_odw_high_id = True
-            if has_odw_high_id and not has_sub_id:
+                        elif odw_id_pattern.match(cell_txt):
+                            has_odw_id = True
+            if not has_sub_id and not has_odw_id:
+                for p in doc.paragraphs:
+                    p_txt = p.text.strip()
+                    if sub_id_pattern.match(p_txt):
+                        has_sub_id = True
+                    elif odw_id_pattern.match(p_txt):
+                        has_odw_id = True
+            if has_odw_id and not has_sub_id:
                 is_odw = True
 
         allowlist_defs = OP_DE_WISCH_SECTION_DEFINITIONS if is_odw else SECTION_DEFINITIONS
         allowlist_map = {d.id: d for d in allowlist_defs}
 
-        sub_id_re = re.compile(r"^(\d\.\d)\.?\s*(.*)$")
-        main_id_re = re.compile(r"^(\d+(?:\.\d+)?)\.?\s*(.*)$")
+        sub_id_re = re.compile(
+            r"^(?:(?:lebensbereich|bereich|abschnitt)\s+)?(\d\.\d)\.?\s*[:\-–—]?\s*(.*)$",
+            re.IGNORECASE,
+        )
+        main_id_re = re.compile(
+            r"^(?:(?:lebensbereich|bereich|abschnitt)\s+)?(\d+(?:\.\d+)?)\.?\s*[:\-–—]?\s*(.*)$",
+            re.IGNORECASE,
+        )
         smart_pattern = r"(?:S\.?M\.?A\.?R\.?T\.?|Smarte?)\s*Ziele?\s*:"
 
         detected_headings: List[str] = []
